@@ -7,6 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ .
 
-EXPOSE 5001
+EXPOSE 10000
 
-CMD ["gunicorn", "main:app", "-b", "0.0.0.0:5001", "--workers", "2"]
+CMD gunicorn main:app -b 0.0.0.0:${PORT:-10000} --workers 2
