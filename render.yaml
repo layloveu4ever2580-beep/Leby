@@ -7,6 +7,10 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn main:app -b 0.0.0.0:$PORT
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.6"
+      - key: ALLOWED_ORIGINS
+        value: "*"
       - key: BYBIT_API_KEY
         sync: false # Requires you to enter this manually in Render dashboard
       - key: BYBIT_API_SECRET
@@ -22,6 +26,8 @@ services:
     buildCommand: npm install && npm run build
     staticPublishPath: dist
     envVars:
+      - key: NODE_VERSION
+        value: "20"
       - key: VITE_API_URL
         fromService:
           type: web
