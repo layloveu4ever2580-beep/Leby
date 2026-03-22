@@ -1,0 +1,29 @@
+services:
+  # 1. Backend API (Flask)
+  - type: web
+    name: bybit-trading-bot-api
+    env: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app -b 0.0.0.0:$PORT
+    envVars:
+      - key: BYBIT_API_KEY
+        sync: false # Requires you to enter this manually in Render dashboard
+      - key: BYBIT_API_SECRET
+        sync: false # Requires you to enter this manually in Render dashboard
+      - key: BYBIT_TESTNET
+        value: "false"
+      
+  # 2. Frontend React Dashboard (Static UI)
+  - type: web
+    name: bybit-trading-bot-dashboard
+    env: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_URL
+        fromService:
+          type: web
+          name: bybit-trading-bot-api
+          envVarKey: RENDER_EXTERNAL_URL
