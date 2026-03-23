@@ -1,6 +1,6 @@
 import os
 import time
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from pybit.unified_trading import HTTP
 from dotenv import load_dotenv
 from flask_cors import CORS
@@ -20,11 +20,19 @@ BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
 PORT = int(os.getenv("PORT", 5001))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
-session = HTTP(
-    testnet=BYBIT_TESTNET,
-    api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET,
-)
+_session = None
+
+
+def get_session():
+    """Lazy-initialize the Bybit HTTP session."""
+    global _session
+    if _session is None:
+        _session = HTTP(
+            testnet=BYBIT_TESTNET,
+            api_key=BYBIT_API_KEY,
+            api_secret=BYBIT_API_SECRET,
+        )
+    return _session
 
 settings = {
     "targetProfit": 100.0,
@@ -60,7 +68,7 @@ def update_settings():
 def get_symbol_info(symbol):
     """Get tick size and lot size constraints for a symbol."""
     try:
-        info = session.get_instruments_info(category="linear", symbol=symbol)
+        info = get_session().get_instruments_info(category="linear", symbol=symbol)
         instrument = info["result"]["list"][0]
         lot_filter = instrument["lotSizeFilter"]
         min_qty = float(lot_filter["minOrderQty"])
@@ -107,7 +115,7 @@ def webhook():
         quantity = round_qty(raw_quantity, min_qty, qty_step)
 
         try:
-            session.set_leverage(
+            get_session().set_leverage(
                 category="linear",
                 symbol=ticker,
                 buyLeverage=str(leverage),
@@ -117,17 +125,19 @@ def webhook():
             pass
 
         # Check if market price is between SL and TP
-        ticker_info = session.get_tickers(category="linear", symbol=ticker)
+        # Buy:  sl < last_price < tp  (price below TP, above SL)
+        # Sell: tp < last_price < sl  (price above TP, below SL)
+        ticker_info = get_session().get_tickers(category="linear", symbol=ticker)
         last_price = float(ticker_info["result"]["list"][0]["lastPrice"])
 
         if side == "Buy":
-            if last_price <= sl or last_price >= tp:
-                return jsonify({"error": "Price validation failed"}), 400
-        else:
-            if last_price >= sl or last_price <= tp:
-                return jsonify({"error": "Price validation failed"}), 400
+            if not (sl < last_price < tp):
+                return jsonify({"error": f"Price validation failed: last={last_price}, sl={sl}, tp={tp}"}), 400
+        else:  # Sell / Short
+            if not (tp < last_price < sl):
+                return jsonify({"error": f"Price validation failed: last={last_price}, tp={tp}, sl={sl}"}), 400
 
-        order = session.place_order(
+        order = get_session().place_order(
             category="linear",
             symbol=ticker,
             side=side,
@@ -170,7 +180,7 @@ def update_trade_tp(trade_id):
     for t in trades:
         if t["id"] == trade_id:
             try:
-                session.set_trading_stop(
+                get_session().set_trading_stop(
                     category="linear",
                     symbol=t["ticker"],
                     takeProfit=str(new_tp),
@@ -187,7 +197,7 @@ def update_trade_tp(trade_id):
 def sync_trades():
     """Sync open positions from Bybit."""
     try:
-        positions = session.get_positions(category="linear", settleCoin="USDT")
+        positions = get_session().get_positions(category="linear", settleCoin="USDT")
         position_list = positions.get("result", {}).get("list", [])
 
         # Build a set of known trade tickers for matching
@@ -209,6 +219,18 @@ def sync_trades():
         return jsonify({"status": "synced", "positions": len(position_list)}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ── Serve React frontend (must be last route) ────────────────────────────────
+DIST_DIR = os.path.join(os.path.dirname(__file__), "dist")
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_react(path):
+    """Serve React build. Falls back to index.html for client-side routing."""
+    if path and os.path.exists(os.path.join(DIST_DIR, path)):
+        return send_from_directory(DIST_DIR, path)
+    return send_from_directory(DIST_DIR, "index.html")
 
 
 if __name__ == "__main__":

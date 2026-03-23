@@ -1,22 +1,19 @@
 services:
-  backend:
-    build: ./backend
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
-      - "5001:5001"
+      - "5001:10000"
     environment:
       - BYBIT_API_KEY=${BYBIT_API_KEY}
       - BYBIT_API_SECRET=${BYBIT_API_SECRET}
       - BYBIT_TESTNET=${BYBIT_TESTNET:-false}
-      - PORT=5001
+      - PORT=10000
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
-      - ALLOWED_ORIGINS=http://localhost:3000
-
-  frontend:
-    build:
-      context: ./frontend
-      args:
-        VITE_API_URL: http://localhost:5001
-    ports:
-      - "3000:3000"
-    depends_on:
-      - backend
+      - ALLOWED_ORIGINS=same-origin
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:10000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

@@ -15,13 +15,14 @@ A trading bot that receives webhook signals, automatically calculates position s
 ## Architecture
 
 ```
-├── backend/          Flask API + Bybit integration
-│   ├── main.py       Webhook handler, trade API, settings
+├── backend/          Flask API + serves React dashboard
+│   ├── main.py       Webhook handler, trade API, settings, static serving
 │   └── leverage_config.py
-├── frontend/         React + Vite dashboard
+├── frontend/         React + Vite dashboard (built into backend/dist)
 │   └── src/App.jsx   Trading dashboard UI
+├── Dockerfile        Multi-stage: builds React, runs Flask
 ├── docker-compose.yml
-└── render.yaml       Render.com deployment config
+└── render.yaml       Render.com deployment (single service)
 ```
 
 ## Quick Start
@@ -36,8 +37,7 @@ A trading bot that receives webhook signals, automatically calculates position s
 
 ```bash
 cd backend
-cp .env.example .env
-# Edit .env with your Bybit API credentials
+# Edit .env with your Bybit API credentials before running
 pip install -r requirements.txt
 python main.py
 ```
@@ -100,7 +100,10 @@ Include the `X-Webhook-Secret` header if `WEBHOOK_SECRET` is configured.
 
 ## Deployment
 
-Configured for [Render.com](https://render.com) via `render.yaml`. Push to your repo and connect it in the Render dashboard.
+Deployed as a **single service** on [Render.com](https://render.com) via `render.yaml`.
+Flask serves both the API and the React dashboard from one URL — no separate frontend service needed.
+
+Push to your repo, connect it in the Render dashboard, and set your environment variables.
 
 ## License
 

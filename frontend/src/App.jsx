@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { Settings, RefreshCw, DollarSign, TrendingUp, Activity, Waves, Loader2 } from 'lucide-react';
 import './App.css';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001';
+const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
 function App() {
   const [trades, setTrades] = useState([]);

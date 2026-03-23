@@ -1,35 +1,17 @@
 services:
-  # 1. Backend API (Flask)
+  # Single service: Flask serves both API and React dashboard
   - type: web
-    name: bybit-trading-bot-api
-    env: python
-    rootDir: backend
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main:app -b 0.0.0.0:$PORT
+    name: bybit-trading-bot
+    env: docker
+    dockerfilePath: ./Dockerfile
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.11.6"
-      - key: ALLOWED_ORIGINS
-        value: "*"
       - key: BYBIT_API_KEY
-        sync: false # Requires you to enter this manually in Render dashboard
+        sync: false
       - key: BYBIT_API_SECRET
-        sync: false # Requires you to enter this manually in Render dashboard
+        sync: false
       - key: BYBIT_TESTNET
         value: "false"
-      
-  # 2. Frontend React Dashboard (Static UI)
-  - type: web
-    name: bybit-trading-bot-dashboard
-    env: static
-    rootDir: frontend
-    buildCommand: npm install && npm run build
-    staticPublishPath: dist
-    envVars:
-      - key: NODE_VERSION
-        value: "20"
-      - key: VITE_API_URL
-        fromService:
-          type: web
-          name: bybit-trading-bot-api
-          envVarKey: RENDER_EXTERNAL_URL
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "same-origin"

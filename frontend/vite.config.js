@@ -6,6 +6,12 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 3000,
-    host: true
+    host: true,
+    // Proxy API calls to Flask backend during local dev
+    proxy: {
+      '/api': 'http://localhost:5001',
+      '/webhook': 'http://localhost:5001',
+      '/health': 'http://localhost:5001',
+    }
   }
 })
