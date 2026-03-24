@@ -1,5 +1,6 @@
 import os
 import time
+import logging
 from flask import Flask, request, jsonify, send_from_directory
 from pybit.unified_trading import HTTP
 from dotenv import load_dotenv
@@ -8,11 +9,17 @@ from leverage_config import LEVERAGE_CONFIG
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
-# CORS: restrict to frontend origin in production
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
-CORS(app, origins=ALLOWED_ORIGINS)
+# CORS: allow same-origin (no restriction needed) or explicit origins
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+if _raw_origins in ("same-origin", "*", ""):
+    CORS(app)  # allow all when served from same origin
+else:
+    CORS(app, origins=_raw_origins.split(","))
 
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
@@ -97,23 +104,38 @@ def webhook():
 
     try:
         data = request.json
+        logger.info(f"Webhook received: {data}")
+
         ticker = data.get("ticker")
         entry = float(data.get("limit") or data.get("entry", 0))
         tp = float(data.get("tp", 0))
         sl = float(data.get("sl", 0))
         side = str(data.get("action") or data.get("side", "Buy")).capitalize()
 
-        if not all([ticker, entry, tp, sl]):
-            return jsonify({"error": "Missing parameters"}), 400
+        if not all([ticker, tp, sl]):
+            return jsonify({"error": "Missing parameters (ticker, tp, sl required)"}), 400
+
+        # Fetch current market price — use it for position sizing
+        ticker_info = get_session().get_tickers(category="linear", symbol=ticker)
+        last_price = float(ticker_info["result"]["list"][0]["lastPrice"])
+        logger.info(f"{ticker} last_price={last_price}, entry={entry}, tp={tp}, sl={sl}, side={side}")
+
+        # Use market price for quantity calc (more accurate than alert's limit price)
+        price_for_calc = last_price if last_price > 0 else entry
+        tp_distance = abs(price_for_calc - tp)
+        if tp_distance == 0:
+            return jsonify({"error": "TP distance is zero, cannot calculate quantity"}), 400
 
         target_profit = settings.get("targetProfit", 100.0)
-        raw_quantity = target_profit / abs(entry - tp)
+        raw_quantity = target_profit / tp_distance
         leverage = LEVERAGE_CONFIG.get(ticker, 10)
 
         # Round quantity to valid lot size
         min_qty, qty_step = get_symbol_info(ticker)
         quantity = round_qty(raw_quantity, min_qty, qty_step)
+        logger.info(f"Calculated qty={quantity} (raw={raw_quantity}, min={min_qty}, step={qty_step})")
 
+        # Set leverage (ignore errors if already set)
         try:
             get_session().set_leverage(
                 category="linear",
@@ -121,22 +143,11 @@ def webhook():
                 buyLeverage=str(leverage),
                 sellLeverage=str(leverage)
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.info(f"set_leverage note: {e}")
 
-        # Check if market price is between SL and TP
-        # Buy:  sl < last_price < tp  (price below TP, above SL)
-        # Sell: tp < last_price < sl  (price above TP, below SL)
-        ticker_info = get_session().get_tickers(category="linear", symbol=ticker)
-        last_price = float(ticker_info["result"]["list"][0]["lastPrice"])
-
-        if side == "Buy":
-            if not (sl < last_price < tp):
-                return jsonify({"error": f"Price validation failed: last={last_price}, sl={sl}, tp={tp}"}), 400
-        else:  # Sell / Short
-            if not (tp < last_price < sl):
-                return jsonify({"error": f"Price validation failed: last={last_price}, tp={tp}, sl={sl}"}), 400
-
+        # Place market order directly — no price validation gate
+        logger.info(f"Placing MARKET {side} order: {ticker} qty={quantity} tp={tp} sl={sl}")
         order = get_session().place_order(
             category="linear",
             symbol=ticker,
@@ -146,12 +157,33 @@ def webhook():
             takeProfit=str(tp),
             stopLoss=str(sl)
         )
+        logger.info(f"Order response: {order}")
+
+        if order.get("retCode", -1) != 0:
+            error_msg = order.get("retMsg", "Unknown Bybit error")
+            logger.error(f"Bybit order rejected: {error_msg}")
+            # Record as failed trade
+            trades.append({
+                "id": "failed",
+                "ticker": ticker,
+                "side": side,
+                "entry": last_price,
+                "tp": tp,
+                "sl": sl,
+                "quantity": quantity,
+                "leverage": leverage,
+                "status": "Failed",
+                "pnl": 0.0,
+                "timestamp": int(time.time() * 1000),
+                "error": error_msg
+            })
+            return jsonify({"error": error_msg}), 400
 
         trade_record = {
-            "id": order["result"]["orderId"] if "result" in order and "orderId" in order["result"] else "unknown",
+            "id": order["result"].get("orderId", "unknown"),
             "ticker": ticker,
             "side": side,
-            "entry": entry,
+            "entry": last_price,
             "tp": tp,
             "sl": sl,
             "quantity": quantity,
@@ -164,6 +196,7 @@ def webhook():
 
         return jsonify({"status": "success", "order": order}), 200
     except Exception as e:
+        logger.exception(f"Webhook error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -197,27 +230,58 @@ def update_trade_tp(trade_id):
 def sync_trades():
     """Sync open positions from Bybit."""
     try:
-        positions = get_session().get_positions(category="linear", settleCoin="USDT")
-        position_list = positions.get("result", {}).get("list", [])
+        session = get_session()
+        positions = session.get_positions(category="linear", settleCoin="USDT")
 
-        # Build a set of known trade tickers for matching
-        known_ids = {t["id"] for t in trades}
+        if positions.get("retCode", -1) != 0:
+            error_msg = positions.get("retMsg", "Bybit API error")
+            logger.error(f"sync_trades Bybit error: {error_msg}")
+            return jsonify({"error": error_msg}), 502
+
+        position_list = positions.get("result", {}).get("list", [])
 
         for pos in position_list:
             size = float(pos.get("size", 0))
             if size == 0:
                 continue
 
-            # Update existing trades with PnL
             symbol = pos.get("symbol", "")
             unrealised_pnl = float(pos.get("unrealisedPnl", 0))
 
+            # Update existing trades with PnL
+            matched = False
             for t in trades:
                 if t["ticker"] == symbol and t["status"] == "Open":
                     t["pnl"] = unrealised_pnl
+                    matched = True
 
+            # If position exists on Bybit but not in local trades, add it
+            if not matched:
+                side_str = pos.get("side", "Buy")
+                trades.append({
+                    "id": f"synced-{symbol}-{int(time.time())}",
+                    "ticker": symbol,
+                    "side": side_str,
+                    "entry": float(pos.get("avgPrice", 0)),
+                    "tp": float(pos.get("takeProfit", 0)),
+                    "sl": float(pos.get("stopLoss", 0)),
+                    "quantity": size,
+                    "leverage": int(float(pos.get("leverage", 1))),
+                    "status": "Open",
+                    "pnl": unrealised_pnl,
+                    "timestamp": int(float(pos.get("createdTime", time.time() * 1000)))
+                })
+
+        # Mark local trades as closed if no matching open position on Bybit
+        open_symbols = {pos.get("symbol") for pos in position_list if float(pos.get("size", 0)) > 0}
+        for t in trades:
+            if t["status"] == "Open" and t["ticker"] not in open_symbols:
+                t["status"] = "Closed"
+
+        logger.info(f"Synced {len(position_list)} positions from Bybit")
         return jsonify({"status": "synced", "positions": len(position_list)}), 200
     except Exception as e:
+        logger.exception(f"sync_trades error: {e}")
         return jsonify({"error": str(e)}), 500
 
 

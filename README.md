@@ -4,11 +4,13 @@ A trading bot that receives webhook signals, automatically calculates position s
 
 ## Features
 
-- Webhook-driven order execution with authentication
-- Automatic position sizing based on target profit
+- Webhook-driven market order execution with authentication
+- Automatic position sizing based on target profit and live market price
 - Leverage configuration per trading pair
 - Real-time trade monitoring dashboard
-- PnL tracking with Bybit position sync
+- PnL tracking with Bybit position sync (imports existing positions on sync)
+- Auto-detection of closed positions during sync
+- Failed order tracking with error details
 - Light/dark theme support
 - Responsive design (mobile/tablet/desktop)
 
@@ -78,11 +80,13 @@ Send a POST request to `/webhook` with the following JSON body:
 {
   "ticker": "BTCUSDT",
   "action": "Buy",
-  "limit": 65000,
+  "entry": 65000,
   "tp": 67000,
   "sl": 64000
 }
 ```
+
+The bot places a **market order** immediately on receiving the alert. The `entry` (or `limit`) field is optional — position sizing uses the live market price for accuracy. Only `ticker`, `tp`, and `sl` are required.
 
 Include the `X-Webhook-Secret` header if `WEBHOOK_SECRET` is configured.
 
