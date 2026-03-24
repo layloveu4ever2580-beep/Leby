@@ -96,15 +96,29 @@ def round_qty(qty, min_qty, qty_step):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Authenticate webhook
-    if WEBHOOK_SECRET:
+    # Authenticate: check header OR JSON body field (TradingView can't send headers)
+    if WEBHOOK_SECRET and WEBHOOK_SECRET != "your_webhook_secret_here":
         token = request.headers.get("X-Webhook-Secret", "")
         if token != WEBHOOK_SECRET:
-            return jsonify({"error": "Unauthorized"}), 401
+            # Also check if secret is embedded in the JSON body
+            body = request.get_json(silent=True) or {}
+            if body.get("secret") != WEBHOOK_SECRET:
+                return jsonify({"error": "Unauthorized"}), 401
 
     try:
-        data = request.json
+        # Handle non-JSON alerts (setup/confirmation text alerts from Pine Script)
+        data = request.get_json(silent=True)
+        if data is None:
+            raw = request.get_data(as_text=True)
+            logger.info(f"Non-JSON webhook received (ignoring): {raw[:200]}")
+            return jsonify({"status": "ignored", "reason": "not a trade signal"}), 200
+
         logger.info(f"Webhook received: {data}")
+
+        # Skip non-trade alerts (text alerts like "Bullish Setup Detected...")
+        if "ticker" not in data or "tp" not in data:
+            logger.info(f"Ignoring non-trade alert: {data}")
+            return jsonify({"status": "ignored", "reason": "not a trade signal"}), 200
 
         ticker = data.get("ticker")
         entry = float(data.get("limit") or data.get("entry", 0))
