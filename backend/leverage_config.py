@@ -4,5 +4,6 @@ LEVERAGE_CONFIG = {
     "SOLUSDT": 20,
     "XRPUSDT": 20,
     "ADAUSDT": 20,
+    "JASMYUSDT": 50,
     # Add more as needed
 }
