@@ -234,77 +234,17 @@ def webhook():
         except Exception as e:
             logger.info(f"set_leverage note: {e}")
 
-        # --- Order placement: Limit first, fallback to Market ---
-        order = None
-        order_type_used = "Market"
-        limit_price = entry if entry > 0 else last_price
-
-        # Try limit order if we have a valid entry price
-        if entry > 0:
-            logger.info(f"Placing LIMIT {side} order: {ticker} qty={quantity} price={limit_price} tp={tp} sl={sl}")
-            try:
-                order = bybit_call(get_session().place_order,
-                                   category="linear", symbol=ticker, side=side,
-                                   orderType="Limit", qty=str(quantity),
-                                   price=str(limit_price),
-                                   takeProfit=str(tp), stopLoss=str(sl),
-                                   timeInForce="GTC")
-
-                if order.get("retCode") == 0:
-                    order_id = order["result"].get("orderId", "")
-                    order_type_used = "Limit"
-                    logger.info(f"Limit order placed: {order_id}, waiting for fill...")
-
-                    # Wait up to 15 seconds for the limit order to fill
-                    filled = False
-                    for i in range(5):
-                        time.sleep(3)
-                        try:
-                            check = bybit_call(get_session().get_open_orders,
-                                               category="linear", symbol=ticker,
-                                               orderId=order_id)
-                            open_orders = check.get("result", {}).get("list", [])
-                            if not open_orders:
-                                # Order no longer open = filled
-                                filled = True
-                                logger.info(f"Limit order filled after {(i+1)*3}s")
-                                break
-                            logger.info(f"Limit order still open, waiting... ({(i+1)*3}s)")
-                        except Exception as e:
-                            logger.warning(f"Error checking order status: {e}")
-                            break
-
-                    if not filled:
-                        # Cancel unfilled limit order and fall back to market
-                        logger.info(f"Limit order not filled after 15s, cancelling and using market order")
-                        try:
-                            bybit_call(get_session().cancel_order,
-                                       category="linear", symbol=ticker,
-                                       orderId=order_id)
-                            logger.info(f"Limit order {order_id} cancelled")
-                        except Exception as e:
-                            logger.warning(f"Cancel order error (may already be filled): {e}")
-                        order = None  # Reset to trigger market order below
-                else:
-                    logger.warning(f"Limit order rejected: {order.get('retMsg')}, falling back to market")
-                    order = None
-            except Exception as e:
-                logger.warning(f"Limit order failed: {e}, falling back to market")
-                order = None
-
-        # Fallback: market order
-        if order is None:
-            order_type_used = "Market"
-            logger.info(f"Placing MARKET {side} order: {ticker} qty={quantity} tp={tp} sl={sl}")
-            order = bybit_call(get_session().place_order,
-                               category="linear", symbol=ticker, side=side,
-                               orderType="Market", qty=str(quantity),
-                               takeProfit=str(tp), stopLoss=str(sl))
-        logger.info(f"Order response: {order}")
+        # 1) Market order to ENTER position (SL only, TP will be a limit order)
+        logger.info(f"Placing MARKET {side} order: {ticker} qty={quantity} sl={sl}")
+        order = bybit_call(get_session().place_order,
+                           category="linear", symbol=ticker, side=side,
+                           orderType="Market", qty=str(quantity),
+                           stopLoss=str(sl))
+        logger.info(f"Entry order response: {order}")
 
         if order.get("retCode", -1) != 0:
             error_msg = order.get("retMsg", "Unknown Bybit error")
-            logger.error(f"Bybit order rejected: {error_msg}")
+            logger.error(f"Bybit entry order rejected: {error_msg}")
             trades.append({
                 "id": "failed",
                 "ticker": ticker, "side": side, "entry": last_price,
@@ -314,12 +254,35 @@ def webhook():
             })
             return jsonify({"error": error_msg}), 400
 
+        # 2) Place limit order for TP (opposite side to close position at exact price)
+        tp_side = "Sell" if side == "Buy" else "Buy"
+        logger.info(f"Placing LIMIT {tp_side} TP order: {ticker} qty={quantity} price={tp}")
+        try:
+            tp_order = bybit_call(get_session().place_order,
+                                  category="linear", symbol=ticker, side=tp_side,
+                                  orderType="Limit", qty=str(quantity),
+                                  price=str(tp), reduceOnly=True,
+                                  timeInForce="GTC")
+            logger.info(f"TP limit order response: {tp_order}")
+            if tp_order.get("retCode") != 0:
+                logger.warning(f"TP limit order failed: {tp_order.get('retMsg')}, setting TP via trading stop")
+                bybit_call(get_session().set_trading_stop,
+                           category="linear", symbol=ticker,
+                           takeProfit=str(tp), positionIdx=0)
+        except Exception as e:
+            logger.warning(f"TP limit order error: {e}, setting TP via trading stop")
+            try:
+                bybit_call(get_session().set_trading_stop,
+                           category="linear", symbol=ticker,
+                           takeProfit=str(tp), positionIdx=0)
+            except Exception:
+                pass
+
         trade_record = {
             "id": order["result"].get("orderId", "unknown"),
-            "ticker": ticker, "side": side, "entry": limit_price if order_type_used == "Limit" else last_price,
+            "ticker": ticker, "side": side, "entry": last_price,
             "tp": tp, "sl": sl, "quantity": quantity,
             "leverage": leverage, "status": "Open", "pnl": 0.0,
-            "orderType": order_type_used,
             "timestamp": int(time.time() * 1000)
         }
         trades.append(trade_record)
