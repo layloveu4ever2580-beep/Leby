@@ -7,5 +7,8 @@ LEVERAGE_CONFIG = {
     "JASMYUSDT": 50,
     "APEUSDT": 50,
     "DEXEUSDT": 20,
+    "FARTCOINUSDT": 75,
+    "YFIUSDT": 25,
+    "ETCUSDT": 50,
     # Add more as needed
 }
