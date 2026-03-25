@@ -106,6 +106,58 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/api/test-bybit", methods=["GET"])
+def test_bybit():
+    """Diagnostic endpoint: test Bybit API connectivity from this server."""
+    results = {}
+    session = get_session()
+
+    # Test 1: Server time (public, no auth)
+    try:
+        resp = session.get_server_time()
+        results["server_time"] = {"status": "ok", "retCode": resp.get("retCode"), "data": resp.get("result")}
+    except Exception as e:
+        results["server_time"] = {"status": "error", "error": str(e)}
+
+    # Test 2: Ticker price (public, no auth)
+    try:
+        resp = session.get_tickers(category="linear", symbol="BTCUSDT")
+        price = resp["result"]["list"][0]["lastPrice"] if resp.get("retCode") == 0 else None
+        results["ticker"] = {"status": "ok", "retCode": resp.get("retCode"), "retMsg": resp.get("retMsg"), "price": price}
+    except Exception as e:
+        results["ticker"] = {"status": "error", "error": str(e)}
+
+    # Test 3: Wallet balance (authenticated)
+    try:
+        resp = session.get_wallet_balance(accountType="UNIFIED")
+        results["wallet"] = {"status": "ok", "retCode": resp.get("retCode"), "retMsg": resp.get("retMsg")}
+        if resp.get("retCode") == 0:
+            coins = resp.get("result", {}).get("list", [])
+            results["wallet"]["accounts"] = len(coins)
+    except Exception as e:
+        results["wallet"] = {"status": "error", "error": str(e)}
+
+    # Test 4: Positions (authenticated)
+    try:
+        resp = session.get_positions(category="linear", settleCoin="USDT")
+        results["positions"] = {"status": "ok", "retCode": resp.get("retCode"), "retMsg": resp.get("retMsg")}
+        if resp.get("retCode") == 0:
+            pos_list = resp.get("result", {}).get("list", [])
+            open_pos = [p for p in pos_list if float(p.get("size", 0)) > 0]
+            results["positions"]["total"] = len(pos_list)
+            results["positions"]["open"] = len(open_pos)
+    except Exception as e:
+        results["positions"] = {"status": "error", "error": str(e)}
+
+    # Test 5: API key info
+    results["config"] = {
+        "api_key_prefix": BYBIT_API_KEY[:6] + "..." if len(BYBIT_API_KEY) > 6 else "(not set)",
+        "testnet": BYBIT_TESTNET,
+    }
+
+    return jsonify(results), 200
+
+
 @app.route("/api/settings", methods=["GET"])
 def get_settings():
     return jsonify(settings), 200
