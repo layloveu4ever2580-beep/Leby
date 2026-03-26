@@ -10,5 +10,6 @@ LEVERAGE_CONFIG = {
     "FARTCOINUSDT": 75,
     "YFIUSDT": 25,
     "ETCUSDT": 50,
+    "ZROUSDT": 25,
     # Add more as needed
 }
