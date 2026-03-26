@@ -83,16 +83,7 @@ else if selected_preset == "Preset 3: Conservative (Swing)"
     calc_fib_sl := -0.285
 
 // -----------------------------------------------------------------------------
-// 3. WEBHOOK FUNCTION
-// -----------------------------------------------------------------------------
-sendWebhook(action, entryPrice, tpPrice, slPrice) =>
-    ticker = syminfo.ticker
-    string cleanTicker = str.replace(ticker, ".P", "")
-    string message = '{"ticker":"' + cleanTicker + '","action":"' + action + '","entry":' + str.tostring(entryPrice) + ',"tp":' + str.tostring(tpPrice) + ',"sl":' + str.tostring(slPrice) + '}'
-    alert(message, alert.freq_once_per_bar_close)
-
-// -----------------------------------------------------------------------------
-// 4. LOGIC CALCULATIONS
+// 3. LOGIC CALCULATIONS
 // -----------------------------------------------------------------------------
 in_session = not use_time or not na(time(timeframe.period, time_session, time_zone))
 in_date_range = not use_date_filter or (time >= start_time and time <= end_time)
@@ -114,7 +105,7 @@ bool is_green = close > open
 bool is_red = close < open
 
 // -----------------------------------------------------------------------------
-// 5. STATE VARIABLES
+// 4. STATE VARIABLES
 // -----------------------------------------------------------------------------
 var bool buy_setup_active = false
 var bool awaiting_buy_reset = true
@@ -131,26 +122,19 @@ var float sell_setup_low = 0.0
 var int sell_setup_index = 0
 
 var float pending_buy_tp = na
-var float pending_buy_sl = na
 var float pending_sell_tp = na
-var float pending_sell_sl = na
-
-// Track previous position size to detect fills
-var float prev_pos_size = 0.0
 
 // -----------------------------------------------------------------------------
-// 6. SMART CANCELLATION
+// 5. SMART CANCELLATION
 // -----------------------------------------------------------------------------
 if strategy.position_size == 0
     if not na(pending_buy_tp) and high >= pending_buy_tp
         strategy.cancel("Long")
         pending_buy_tp := na
-        pending_buy_sl := na
         label.new(bar_index, high, "Cancelled\n(Target Hit)", color=color.gray, textcolor=color.white, style=label.style_label_down, size=size.tiny)
     if not na(pending_sell_tp) and low <= pending_sell_tp
         strategy.cancel("Short")
         pending_sell_tp := na
-        pending_sell_sl := na
         label.new(bar_index, low, "Cancelled\n(Target Hit)", color=color.gray, textcolor=color.white, style=label.style_label_up, size=size.tiny)
 
 if strategy.position_size != 0
@@ -158,7 +142,7 @@ if strategy.position_size != 0
     pending_sell_tp := na
 
 // -----------------------------------------------------------------------------
-// 7. BUY LOGIC
+// 6. BUY LOGIC
 // -----------------------------------------------------------------------------
 bool is_above_all = (low > max_ema) and is_green
 
@@ -204,7 +188,7 @@ if buy_setup_active and bar_index > buy_setup_index
             hard_lock_buy := true
 
 // -----------------------------------------------------------------------------
-// 8. SELL LOGIC
+// 7. SELL LOGIC
 // -----------------------------------------------------------------------------
 bool is_below_all = (high < min_ema) and is_red
 
@@ -250,7 +234,11 @@ if sell_setup_active and bar_index > sell_setup_index
             hard_lock_sell := true
 
 // -----------------------------------------------------------------------------
-// 9. EXECUTION & VISUALS (NO webhook here — webhook fires on FILL only)
+// 8. EXECUTION & VISUALS
+//    With "Order fills only" alert mode, the alert Message is sent ONLY when
+//    strategy.entry() limit order actually fills. We embed the JSON in the
+//    strategy.entry() comment field, then use {{strategy.order.comment}} in
+//    the alert Message.
 // -----------------------------------------------------------------------------
 plotshape(new_buy_signal and is_green, style=shape.circle, location=location.abovebar, color=color.blue, size=size.tiny, title="Buy Setup")
 plotshape(buy_confirmed and is_green, style=shape.circle, location=location.abovebar, color=color.green, size=size.small, title="Buy Confirm")
@@ -267,13 +255,14 @@ if buy_confirmed
     float stop_loss   = fib_0 + (fib_range * calc_fib_sl)
     float pos_size = (trade_amt * leverage) / entry_price
 
-    // Store TP/SL for webhook on fill
     pending_buy_tp := take_profit
-    pending_buy_sl := stop_loss
     pending_sell_tp := na
-    pending_sell_sl := na
 
-    strategy.entry("Long", strategy.long, qty=pos_size, limit=entry_price, comment="Entry")
+    // Build JSON for webhook — embedded in comment so {{strategy.order.comment}} sends it
+    string cleanTicker = str.replace(syminfo.ticker, ".P", "")
+    string webhook_json = '{"ticker":"' + cleanTicker + '","action":"buy","entry":' + str.tostring(entry_price) + ',"tp":' + str.tostring(take_profit) + ',"sl":' + str.tostring(stop_loss) + '}'
+
+    strategy.entry("Long", strategy.long, qty=pos_size, limit=entry_price, comment=webhook_json)
     strategy.exit("Exit Long", "Long", limit=take_profit, stop=stop_loss, comment_loss="SL Hit", comment_profit="TP Hit")
 
     line.new(bar_index, entry_price, bar_index + 10, entry_price, color=color.blue, style=line.style_dashed, width=1)
@@ -290,13 +279,14 @@ if sell_confirmed
     float stop_loss   = fib_0 - (fib_range * calc_fib_sl)
     float pos_size = (trade_amt * leverage) / entry_price
 
-    // Store TP/SL for webhook on fill
     pending_sell_tp := take_profit
-    pending_sell_sl := stop_loss
     pending_buy_tp := na
-    pending_buy_sl := na
 
-    strategy.entry("Short", strategy.short, qty=pos_size, limit=entry_price, comment="Entry")
+    // Build JSON for webhook — embedded in comment so {{strategy.order.comment}} sends it
+    string cleanTicker = str.replace(syminfo.ticker, ".P", "")
+    string webhook_json = '{"ticker":"' + cleanTicker + '","action":"sell","entry":' + str.tostring(entry_price) + ',"tp":' + str.tostring(take_profit) + ',"sl":' + str.tostring(stop_loss) + '}'
+
+    strategy.entry("Short", strategy.short, qty=pos_size, limit=entry_price, comment=webhook_json)
     strategy.exit("Exit Short", "Short", limit=take_profit, stop=stop_loss, comment_loss="SL Hit", comment_profit="TP Hit")
 
     line.new(bar_index, entry_price, bar_index + 10, entry_price, color=color.yellow, style=line.style_dashed, width=1)
@@ -304,25 +294,7 @@ if sell_confirmed
     line.new(bar_index, take_profit, bar_index + 10, take_profit, color=color.green, style=line.style_solid, width=1)
 
 // -----------------------------------------------------------------------------
-// 9B. WEBHOOK ON ACTUAL FILL — only fires when position size changes
-// -----------------------------------------------------------------------------
-if enable_webhooks
-    // New long position opened (was flat or short, now long)
-    if strategy.position_size > 0 and prev_pos_size <= 0
-        float fill_tp = not na(pending_buy_tp) ? pending_buy_tp : 0.0
-        float fill_sl = not na(pending_buy_sl) ? pending_buy_sl : 0.0
-        sendWebhook("buy", strategy.position_avg_price, fill_tp, fill_sl)
-
-    // New short position opened (was flat or long, now short)
-    if strategy.position_size < 0 and prev_pos_size >= 0
-        float fill_tp = not na(pending_sell_tp) ? pending_sell_tp : 0.0
-        float fill_sl = not na(pending_sell_sl) ? pending_sell_sl : 0.0
-        sendWebhook("sell", strategy.position_avg_price, fill_tp, fill_sl)
-
-prev_pos_size := strategy.position_size
-
-// -----------------------------------------------------------------------------
-// 10. RESULTS DASHBOARD
+// 9. RESULTS DASHBOARD
 // -----------------------------------------------------------------------------
 var table results_tbl = table.new(position.top_right, 2, 6, bgcolor = color.white, border_width = 1, border_color = color.black)
 

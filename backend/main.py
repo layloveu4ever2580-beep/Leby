@@ -238,9 +238,17 @@ def webhook():
     try:
         data = request.get_json(silent=True)
         if data is None:
-            raw = request.get_data(as_text=True)
-            logger.info(f"Non-JSON webhook received (ignoring): {raw[:200]}")
-            return jsonify({"status": "ignored", "reason": "not a trade signal"}), 200
+            # Try to parse raw text — "Order fills only" may send the comment as plain text
+            raw = request.get_data(as_text=True).strip()
+            logger.info(f"Raw webhook body: {raw[:500]}")
+            if raw.startswith("{"):
+                import json
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    pass
+            if data is None:
+                return jsonify({"status": "ignored", "reason": "not a trade signal"}), 200
 
         logger.info(f"Webhook received: {data}")
 
