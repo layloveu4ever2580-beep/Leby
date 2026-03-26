@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import threading
 from flask import Flask, request, jsonify, send_from_directory
 from pybit.unified_trading import HTTP
 from dotenv import load_dotenv
@@ -99,6 +100,54 @@ settings = {
     "timezone": "UTC"
 }
 trades = []
+
+# Track TP limit orders: { symbol: { "orderId": "...", "side": "Sell", "qty": "..." } }
+_tp_orders = {}
+
+
+def cleanup_orphaned_tp_orders():
+    """Background task: cancel TP limit orders for positions that no longer exist (SL hit)."""
+    while True:
+        try:
+            time.sleep(30)
+            if not _tp_orders:
+                continue
+
+            session = get_session()
+            positions = bybit_call(session.get_positions, category="linear", settleCoin="USDT")
+            if positions.get("retCode") != 0:
+                continue
+
+            position_list = positions.get("result", {}).get("list", [])
+            open_symbols = {p.get("symbol") for p in position_list if float(p.get("size", 0)) > 0}
+
+            # Find TP orders for closed positions
+            symbols_to_cancel = [sym for sym in list(_tp_orders.keys()) if sym not in open_symbols]
+
+            for sym in symbols_to_cancel:
+                tp_info = _tp_orders.pop(sym, None)
+                if tp_info:
+                    try:
+                        logger.info(f"SL hit detected for {sym}, cancelling TP limit order {tp_info['orderId']}")
+                        bybit_call(session.cancel_order,
+                                   category="linear", symbol=sym,
+                                   orderId=tp_info["orderId"])
+                        logger.info(f"TP order cancelled for {sym}")
+
+                        # Update trade status
+                        for t in trades:
+                            if t["ticker"] == sym and t["status"] == "Open":
+                                t["status"] = "Closed"
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel TP order for {sym}: {e}")
+
+        except Exception as e:
+            logger.warning(f"TP cleanup error: {e}")
+
+
+# Start background cleanup thread
+_cleanup_thread = threading.Thread(target=cleanup_orphaned_tp_orders, daemon=True)
+_cleanup_thread.start()
 
 
 @app.route("/health", methods=["GET"])
@@ -264,7 +313,14 @@ def webhook():
                                   price=str(tp), reduceOnly=True,
                                   timeInForce="GTC")
             logger.info(f"TP limit order response: {tp_order}")
-            if tp_order.get("retCode") != 0:
+            if tp_order.get("retCode") == 0:
+                # Track this TP order so we can cancel it if SL hits
+                _tp_orders[ticker] = {
+                    "orderId": tp_order["result"].get("orderId", ""),
+                    "side": tp_side,
+                    "qty": str(quantity)
+                }
+            else:
                 logger.warning(f"TP limit order failed: {tp_order.get('retMsg')}, setting TP via trading stop")
                 bybit_call(get_session().set_trading_stop,
                            category="linear", symbol=ticker,
