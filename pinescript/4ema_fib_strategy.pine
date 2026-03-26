@@ -1,0 +1,369 @@
+//@version=6
+strategy("4 EMA Fib Strategy (With Presets + Webhooks)", overlay=true, initial_capital=1000, default_qty_type=strategy.cash, default_qty_value=50, currency=currency.USD)
+
+// -----------------------------------------------------------------------------
+// 1. PRESETS & INPUTS
+// -----------------------------------------------------------------------------
+grp_preset = "🔴 1. STRATEGY PRESETS 🔴"
+selected_preset = input.string("Custom (Use Settings Below)", "Select Preset Profile", options=["Custom (Use Settings Below)", "Preset 1: Aggressive (Scalp)", "Preset 2: Balanced (Day)", "Preset 3: Conservative (Swing)"], group=grp_preset)
+
+// --- EMA SETTINGS (CUSTOM) ---
+grp_ema = "2. EMA Settings (Custom)"
+in_len1 = input.int(20, "EMA 1 Length", group=grp_ema)
+in_len2 = input.int(50, "EMA 2 Length", group=grp_ema)
+in_len3 = input.int(100, "EMA 3 Length", group=grp_ema)
+in_len4 = input.int(200, "EMA 4 Length", group=grp_ema)
+
+// --- FIBONACCI SETTINGS (CUSTOM) ---
+grp_fib = "3. Fibonacci Settings (Custom)"
+in_fib_entry = input.float(0.786, "Entry Level (Fib)", group=grp_fib, step=0.01)
+in_fib_tp    = input.float(1.638, "Take Profit Level (Fib)", group=grp_fib, step=0.01)
+in_fib_sl    = input.float(-0.315, "Stop Loss Level (Fib)", group=grp_fib, step=0.01)
+
+// --- SESSION TIME FILTER ---
+grp_time = "Session Time Filter"
+use_time = input.bool(true, "Enable Session Filter", group=grp_time)
+time_session = input.session("0800-2100", "Trading Session", group=grp_time)
+time_zone = input.string("Asia/Ho_Chi_Minh", "Timezone", group=grp_time)
+
+// --- BACKTESTING DATE RANGE ---
+grp_backtest = "Backtesting Date Range"
+use_date_filter = input.bool(true, "Filter by Date Range", group=grp_backtest)
+start_time = input.time(timestamp("01 Jan 2024 00:00"), "Start Date", group=grp_backtest)
+end_time   = input.time(timestamp("01 Jan 2030 00:00"), "End Date", group=grp_backtest)
+
+// --- POSITION SIZING ---
+grp_pos = "Position Sizing"
+leverage = input.int(1, "Leverage (x)", minval=1, maxval=100, group=grp_pos)
+trade_amt = input.float(50.0, "Fixed Trade Amount ($)", minval=1.0, group=grp_pos)
+
+grp_alert = "Notifications"
+use_alerts = input.bool(true, "Enable Pop-up Alerts", group=grp_alert)
+
+// --- WEBHOOK SETTINGS ---
+grp_webhook = "🚀 Webhook Settings 🚀"
+enable_webhooks = input.bool(true, "Enable Webhook Alerts", group=grp_webhook, tooltip="Send trade signals to your trading bot via webhook")
+
+// -----------------------------------------------------------------------------
+// 2. PRESET LOGIC (OVERRIDES)
+// -----------------------------------------------------------------------------
+int calc_len1 = in_len1
+int calc_len2 = in_len2
+int calc_len3 = in_len3
+int calc_len4 = in_len4
+float calc_fib_entry = in_fib_entry
+float calc_fib_tp = in_fib_tp
+float calc_fib_sl = in_fib_sl
+
+if selected_preset == "Preset 1: Aggressive (Scalp)"
+    calc_len1 := 306
+    calc_len2 := 350
+    calc_len3 := 500
+    calc_len4 := 530
+    calc_fib_entry := 0.746
+    calc_fib_tp := 1.908
+    calc_fib_sl := -0.315
+
+else if selected_preset == "Preset 2: Balanced (Day)"
+    calc_len1 := 293
+    calc_len2 := 300
+    calc_len3 := 800
+    calc_len4 := 900
+    calc_fib_entry := 0.726
+    calc_fib_tp := 1.708
+    calc_fib_sl := -0.175
+
+else if selected_preset == "Preset 3: Conservative (Swing)"
+    calc_len1 := 288
+    calc_len2 := 300
+    calc_len3 := 600
+    calc_len4 := 820
+    calc_fib_entry := 0.766
+    calc_fib_tp := 1.838
+    calc_fib_sl := -0.285
+
+// -----------------------------------------------------------------------------
+// 3. WEBHOOK FUNCTION
+// -----------------------------------------------------------------------------
+sendWebhook(action, entryPrice, tpPrice, slPrice) =>
+    ticker = syminfo.ticker
+    string cleanTicker = str.replace(ticker, ".P", "")
+    string message = '{"ticker":"' + cleanTicker + '","action":"' + action + '","entry":' + str.tostring(entryPrice) + ',"tp":' + str.tostring(tpPrice) + ',"sl":' + str.tostring(slPrice) + '}'
+    alert(message, alert.freq_once_per_bar_close)
+
+// -----------------------------------------------------------------------------
+// 4. LOGIC CALCULATIONS
+// -----------------------------------------------------------------------------
+in_session = not use_time or not na(time(timeframe.period, time_session, time_zone))
+in_date_range = not use_date_filter or (time >= start_time and time <= end_time)
+
+ema1 = ta.ema(close, calc_len1)
+ema2 = ta.ema(close, calc_len2)
+ema3 = ta.ema(close, calc_len3)
+ema4 = ta.ema(close, calc_len4)
+
+plot(ema1, color=color.yellow, title="EMA 1")
+plot(ema2, color=color.orange, title="EMA 2")
+plot(ema3, color=color.red, title="EMA 3")
+plot(ema4, color=color.maroon, title="EMA 4")
+
+float max_ema = math.max(ema1, ema2, ema3, ema4)
+float min_ema = math.min(ema1, ema2, ema3, ema4)
+
+bool is_green = close > open
+bool is_red = close < open
+
+// -----------------------------------------------------------------------------
+// 5. STATE VARIABLES
+// -----------------------------------------------------------------------------
+var bool buy_setup_active = false
+var bool awaiting_buy_reset = true
+var bool hard_lock_buy = false
+var float buy_setup_high = 0.0
+var float buy_setup_low = 0.0
+var int buy_setup_index = 0
+
+var bool sell_setup_active = false
+var bool awaiting_sell_reset = true
+var bool hard_lock_sell = false
+var float sell_setup_high = 0.0
+var float sell_setup_low = 0.0
+var int sell_setup_index = 0
+
+var float pending_buy_tp = na
+var float pending_buy_sl = na
+var float pending_sell_tp = na
+var float pending_sell_sl = na
+
+// Track previous position size to detect fills
+var float prev_pos_size = 0.0
+
+// -----------------------------------------------------------------------------
+// 6. SMART CANCELLATION
+// -----------------------------------------------------------------------------
+if strategy.position_size == 0
+    if not na(pending_buy_tp) and high >= pending_buy_tp
+        strategy.cancel("Long")
+        pending_buy_tp := na
+        pending_buy_sl := na
+        label.new(bar_index, high, "Cancelled\n(Target Hit)", color=color.gray, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+    if not na(pending_sell_tp) and low <= pending_sell_tp
+        strategy.cancel("Short")
+        pending_sell_tp := na
+        pending_sell_sl := na
+        label.new(bar_index, low, "Cancelled\n(Target Hit)", color=color.gray, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+if strategy.position_size != 0
+    pending_buy_tp := na
+    pending_sell_tp := na
+
+// -----------------------------------------------------------------------------
+// 7. BUY LOGIC
+// -----------------------------------------------------------------------------
+bool is_above_all = (low > max_ema) and is_green
+
+if hard_lock_buy
+    if low <= max_ema
+        hard_lock_buy := false
+        awaiting_buy_reset := true
+        buy_setup_active := false
+else
+    if not awaiting_buy_reset
+        if (low <= max_ema) or (close < buy_setup_low)
+            awaiting_buy_reset := true
+    if buy_setup_active
+        if low <= max_ema
+            buy_setup_active := false
+            awaiting_buy_reset := true
+        else if close < buy_setup_low
+            buy_setup_active := false
+            awaiting_buy_reset := true
+
+bool new_buy_signal = is_above_all and not buy_setup_active and awaiting_buy_reset and not hard_lock_buy
+
+if new_buy_signal
+    if use_alerts
+        alert("Bullish Setup Detected at " + str.tostring(close), alert.freq_once_per_bar_close)
+    buy_setup_active := true
+    buy_setup_high := high
+    buy_setup_low := low
+    buy_setup_index := bar_index
+    awaiting_buy_reset := false
+
+bool buy_confirmed = false
+if buy_setup_active and bar_index > buy_setup_index
+    if close > buy_setup_high and is_above_all
+        if in_session and in_date_range
+            buy_confirmed := true
+            buy_setup_active := false
+            hard_lock_buy := true
+            if use_alerts
+                alert("LONG CONFIRMED. Entering Limit Order. Price: " + str.tostring(close), alert.freq_once_per_bar_close)
+        else
+            buy_setup_active := false
+            hard_lock_buy := true
+
+// -----------------------------------------------------------------------------
+// 8. SELL LOGIC
+// -----------------------------------------------------------------------------
+bool is_below_all = (high < min_ema) and is_red
+
+if hard_lock_sell
+    if high >= min_ema
+        hard_lock_sell := false
+        awaiting_sell_reset := true
+        sell_setup_active := false
+else
+    if not awaiting_sell_reset
+        if (high >= min_ema) or (close > sell_setup_high)
+            awaiting_sell_reset := true
+    if sell_setup_active
+        if high >= min_ema
+            sell_setup_active := false
+            awaiting_sell_reset := true
+        else if close > sell_setup_high
+            sell_setup_active := false
+            awaiting_sell_reset := true
+
+bool new_sell_signal = is_below_all and not sell_setup_active and awaiting_sell_reset and not hard_lock_sell
+
+if new_sell_signal
+    if use_alerts
+        alert("Bearish Setup Detected at " + str.tostring(close), alert.freq_once_per_bar_close)
+    sell_setup_active := true
+    sell_setup_high := high
+    sell_setup_low := low
+    sell_setup_index := bar_index
+    awaiting_sell_reset := false
+
+bool sell_confirmed = false
+if sell_setup_active and bar_index > sell_setup_index
+    if close < sell_setup_low and is_below_all
+        if in_session and in_date_range
+            sell_confirmed := true
+            sell_setup_active := false
+            hard_lock_sell := true
+            if use_alerts
+                alert("SHORT CONFIRMED. Entering Limit Order. Price: " + str.tostring(close), alert.freq_once_per_bar_close)
+        else
+            sell_setup_active := false
+            hard_lock_sell := true
+
+// -----------------------------------------------------------------------------
+// 9. EXECUTION & VISUALS (NO webhook here — webhook fires on FILL only)
+// -----------------------------------------------------------------------------
+plotshape(new_buy_signal and is_green, style=shape.circle, location=location.abovebar, color=color.blue, size=size.tiny, title="Buy Setup")
+plotshape(buy_confirmed and is_green, style=shape.circle, location=location.abovebar, color=color.green, size=size.small, title="Buy Confirm")
+plotshape(new_sell_signal and is_red, style=shape.circle, location=location.abovebar, color=color.yellow, size=size.tiny, title="Sell Setup")
+plotshape(sell_confirmed and is_red, style=shape.circle, location=location.abovebar, color=color.red, size=size.small, title="Sell Confirm")
+
+// LONG ENTRY
+if buy_confirmed
+    float fib_0 = buy_setup_low
+    float fib_1 = high
+    float fib_range = fib_1 - fib_0
+    float entry_price = fib_0 + (fib_range * calc_fib_entry)
+    float take_profit = fib_0 + (fib_range * calc_fib_tp)
+    float stop_loss   = fib_0 + (fib_range * calc_fib_sl)
+    float pos_size = (trade_amt * leverage) / entry_price
+
+    // Store TP/SL for webhook on fill
+    pending_buy_tp := take_profit
+    pending_buy_sl := stop_loss
+    pending_sell_tp := na
+    pending_sell_sl := na
+
+    strategy.entry("Long", strategy.long, qty=pos_size, limit=entry_price, comment="Entry")
+    strategy.exit("Exit Long", "Long", limit=take_profit, stop=stop_loss, comment_loss="SL Hit", comment_profit="TP Hit")
+
+    line.new(bar_index, entry_price, bar_index + 10, entry_price, color=color.blue, style=line.style_dashed, width=1)
+    line.new(bar_index, stop_loss, bar_index + 10, stop_loss, color=color.red, style=line.style_solid, width=1)
+    line.new(bar_index, take_profit, bar_index + 10, take_profit, color=color.green, style=line.style_solid, width=1)
+
+// SHORT ENTRY
+if sell_confirmed
+    float fib_0 = sell_setup_high
+    float fib_1 = low
+    float fib_range = fib_0 - fib_1
+    float entry_price = fib_0 - (fib_range * calc_fib_entry)
+    float take_profit = fib_0 - (fib_range * calc_fib_tp)
+    float stop_loss   = fib_0 - (fib_range * calc_fib_sl)
+    float pos_size = (trade_amt * leverage) / entry_price
+
+    // Store TP/SL for webhook on fill
+    pending_sell_tp := take_profit
+    pending_sell_sl := stop_loss
+    pending_buy_tp := na
+    pending_buy_sl := na
+
+    strategy.entry("Short", strategy.short, qty=pos_size, limit=entry_price, comment="Entry")
+    strategy.exit("Exit Short", "Short", limit=take_profit, stop=stop_loss, comment_loss="SL Hit", comment_profit="TP Hit")
+
+    line.new(bar_index, entry_price, bar_index + 10, entry_price, color=color.yellow, style=line.style_dashed, width=1)
+    line.new(bar_index, stop_loss, bar_index + 10, stop_loss, color=color.red, style=line.style_solid, width=1)
+    line.new(bar_index, take_profit, bar_index + 10, take_profit, color=color.green, style=line.style_solid, width=1)
+
+// -----------------------------------------------------------------------------
+// 9B. WEBHOOK ON ACTUAL FILL — only fires when position size changes
+// -----------------------------------------------------------------------------
+if enable_webhooks
+    // New long position opened (was flat or short, now long)
+    if strategy.position_size > 0 and prev_pos_size <= 0
+        float fill_tp = not na(pending_buy_tp) ? pending_buy_tp : 0.0
+        float fill_sl = not na(pending_buy_sl) ? pending_buy_sl : 0.0
+        sendWebhook("buy", strategy.position_avg_price, fill_tp, fill_sl)
+
+    // New short position opened (was flat or long, now short)
+    if strategy.position_size < 0 and prev_pos_size >= 0
+        float fill_tp = not na(pending_sell_tp) ? pending_sell_tp : 0.0
+        float fill_sl = not na(pending_sell_sl) ? pending_sell_sl : 0.0
+        sendWebhook("sell", strategy.position_avg_price, fill_tp, fill_sl)
+
+prev_pos_size := strategy.position_size
+
+// -----------------------------------------------------------------------------
+// 10. RESULTS DASHBOARD
+// -----------------------------------------------------------------------------
+var table results_tbl = table.new(position.top_right, 2, 6, bgcolor = color.white, border_width = 1, border_color = color.black)
+
+if barstate.islast or barstate.isconfirmed
+    int total_trades = strategy.closedtrades
+    int winning_trades = strategy.wintrades
+    int losing_trades = total_trades - winning_trades
+    float win_rate = total_trades > 0 ? (winning_trades / total_trades) * 100 : 0.0
+
+    color c_head_bg = #2962FF
+    color c_win_bg  = #00E676
+    color c_loss_bg = #FF1744
+    color c_rate_bg = #FF9100
+    color c_mode_bg = #607D8B
+    color c_webhook_bg = enable_webhooks ? #00E676 : #FF1744
+    color c_val_text = color.black
+    color c_lbl_text = color.white
+
+    string mode_name = "Custom"
+    if selected_preset == "Preset 1: Aggressive (Scalp)"
+        mode_name := "P1: Aggr."
+    else if selected_preset == "Preset 2: Balanced (Day)"
+        mode_name := "P2: Bal."
+    else if selected_preset == "Preset 3: Conservative (Swing)"
+        mode_name := "P3: Cons."
+
+    table.cell(results_tbl, 0, 0, "MODE", text_color=c_lbl_text, bgcolor=c_mode_bg, text_size=size.small)
+    table.cell(results_tbl, 1, 0, mode_name, text_color=c_lbl_text, bgcolor=c_mode_bg, text_size=size.small)
+
+    string webhook_status = enable_webhooks ? "ON" : "OFF"
+    table.cell(results_tbl, 0, 1, "WEBHOOK", text_color=c_lbl_text, bgcolor=c_webhook_bg, text_size=size.small)
+    table.cell(results_tbl, 1, 1, webhook_status, text_color=c_lbl_text, bgcolor=c_webhook_bg, text_size=size.small)
+
+    table.cell(results_tbl, 0, 2, "TOTAL", text_color=c_lbl_text, bgcolor=c_head_bg, text_size=size.small)
+    table.cell(results_tbl, 1, 2, str.tostring(total_trades), text_color=c_val_text, bgcolor=color.white, text_size=size.small)
+
+    table.cell(results_tbl, 0, 3, "WINS", text_color=c_lbl_text, bgcolor=c_win_bg, text_size=size.small)
+    table.cell(results_tbl, 1, 3, str.tostring(winning_trades), text_color=color.green, bgcolor=color.white, text_size=size.small)
+
+    table.cell(results_tbl, 0, 4, "LOSSES", text_color=c_lbl_text, bgcolor=c_loss_bg, text_size=size.small)
+    table.cell(results_tbl, 1, 4, str.tostring(losing_trades), text_color=color.red, bgcolor=color.white, text_size=size.small)
+
+    table.cell(results_tbl, 0, 5, "WIN %", text_color=c_lbl_text, bgcolor=c_rate_bg, text_size=size.small)
+    table.cell(results_tbl, 1, 5, str.tostring(win_rate, "#.##") + "%", text_color=c_val_text, bgcolor=color.white, text_size=size.small)
