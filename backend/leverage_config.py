@@ -14,5 +14,6 @@ LEVERAGE_CONFIG = {
     "PENGUUSDT": 75,
     "ILVUSDT": 20,
     "MAGICUSDT": 25,
+    "DOGEUSDT": 75,
     # Add more as needed
 }
