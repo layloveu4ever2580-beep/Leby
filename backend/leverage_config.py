@@ -11,5 +11,8 @@ LEVERAGE_CONFIG = {
     "YFIUSDT": 25,
     "ETCUSDT": 50,
     "ZROUSDT": 25,
+    "PENGUUSDT": 75,
+    "ILVUSDT": 20,
+    "MAGICUSDT": 25,
     # Add more as needed
 }
