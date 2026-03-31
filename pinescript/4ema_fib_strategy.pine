@@ -250,18 +250,25 @@ if buy_confirmed
     float fib_0 = buy_setup_low
     float fib_1 = high
     float fib_range = fib_1 - fib_0
-    float entry_price = fib_0 + (fib_range * calc_fib_entry)
+    float fib_entry = fib_0 + (fib_range * calc_fib_entry)
     float take_profit = fib_0 + (fib_range * calc_fib_tp)
     float stop_loss   = fib_0 + (fib_range * calc_fib_sl)
+    // If confirmation candle closed below fib entry, use close to avoid a higher limit price
+    float entry_price = math.min(fib_entry, close)
     float pos_size = (trade_amt * leverage) / entry_price
 
     pending_buy_tp := take_profit
     pending_sell_tp := na
 
-    // Build JSON for webhook — embedded in comment so {{strategy.order.comment}} sends it
+    // Build JSON for webhook
     string cleanTicker = str.replace(syminfo.ticker, ".P", "")
     string webhook_json = '{"ticker":"' + cleanTicker + '","action":"buy","entry":' + str.tostring(entry_price) + ',"tp":' + str.tostring(take_profit) + ',"sl":' + str.tostring(stop_loss) + '}'
 
+    // Send webhook alert immediately on confirmation candle close (limit entry signal)
+    if enable_webhooks
+        alert(webhook_json, alert.freq_once_per_bar_close)
+
+    // Backtest execution (kept for strategy tester accuracy)
     strategy.entry("Long", strategy.long, qty=pos_size, limit=entry_price, comment=webhook_json)
     strategy.exit("Exit Long", "Long", limit=take_profit, stop=stop_loss, comment_loss="SL Hit", comment_profit="TP Hit")
 
@@ -274,18 +281,25 @@ if sell_confirmed
     float fib_0 = sell_setup_high
     float fib_1 = low
     float fib_range = fib_0 - fib_1
-    float entry_price = fib_0 - (fib_range * calc_fib_entry)
+    float fib_entry = fib_0 - (fib_range * calc_fib_entry)
     float take_profit = fib_0 - (fib_range * calc_fib_tp)
     float stop_loss   = fib_0 - (fib_range * calc_fib_sl)
+    // If confirmation candle closed above fib entry, use close to avoid a lower limit price
+    float entry_price = math.max(fib_entry, close)
     float pos_size = (trade_amt * leverage) / entry_price
 
     pending_sell_tp := take_profit
     pending_buy_tp := na
 
-    // Build JSON for webhook — embedded in comment so {{strategy.order.comment}} sends it
+    // Build JSON for webhook
     string cleanTicker = str.replace(syminfo.ticker, ".P", "")
     string webhook_json = '{"ticker":"' + cleanTicker + '","action":"sell","entry":' + str.tostring(entry_price) + ',"tp":' + str.tostring(take_profit) + ',"sl":' + str.tostring(stop_loss) + '}'
 
+    // Send webhook alert immediately on confirmation candle close (limit entry signal)
+    if enable_webhooks
+        alert(webhook_json, alert.freq_once_per_bar_close)
+
+    // Backtest execution (kept for strategy tester accuracy)
     strategy.entry("Short", strategy.short, qty=pos_size, limit=entry_price, comment=webhook_json)
     strategy.exit("Exit Short", "Short", limit=take_profit, stop=stop_loss, comment_loss="SL Hit", comment_profit="TP Hit")
 

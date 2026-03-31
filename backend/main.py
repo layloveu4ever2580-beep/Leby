@@ -97,7 +97,7 @@ def round_qty(qty, min_qty, qty_step):
 settings = {
     "targetProfit": 30.0,
     "theme": "dark",
-    "timezone": "UTC"
+    "timezone": "UTC",
 }
 trades = []
 
@@ -291,27 +291,39 @@ def webhook():
         except Exception as e:
             logger.info(f"set_leverage note: {e}")
 
-        # 1) Market order to ENTER position (SL only, TP will be a limit order)
-        logger.info(f"Placing MARKET {side} order: {ticker} qty={quantity} sl={sl}")
+        # Round entry price to tick size
+        limit_price = entry
+        try:
+            info = bybit_call(get_session().get_instruments_info, category="linear", symbol=ticker)
+            tick_size = float(info["result"]["list"][0]["priceFilter"]["tickSize"])
+            limit_price = round(round(limit_price / tick_size) * tick_size, 8)
+        except Exception:
+            limit_price = round(limit_price, 4)
+
+        # 1) LIMIT order to ENTER position with SL attached
+        logger.info(f"Placing LIMIT {side} entry: {ticker} qty={quantity} price={limit_price} sl={sl}")
         order = bybit_call(get_session().place_order,
                            category="linear", symbol=ticker, side=side,
-                           orderType="Market", qty=str(quantity),
-                           stopLoss=str(sl))
-        logger.info(f"Entry order response: {order}")
+                           orderType="Limit", qty=str(quantity),
+                           price=str(limit_price), stopLoss=str(sl),
+                           timeInForce="GTC")
+        logger.info(f"Limit entry response: {order}")
 
         if order.get("retCode", -1) != 0:
             error_msg = order.get("retMsg", "Unknown Bybit error")
-            logger.error(f"Bybit entry order rejected: {error_msg}")
+            logger.error(f"Bybit limit entry rejected: {error_msg}")
             trades.append({
-                "id": "failed",
-                "ticker": ticker, "side": side, "entry": last_price,
-                "tp": tp, "sl": sl, "quantity": quantity,
-                "leverage": leverage, "status": "Failed", "pnl": 0.0,
+                "id": "failed", "ticker": ticker, "side": side,
+                "entry": limit_price, "tp": tp, "sl": sl,
+                "quantity": quantity, "leverage": leverage,
+                "status": "Failed", "pnl": 0.0,
                 "timestamp": int(time.time() * 1000), "error": error_msg
             })
             return jsonify({"error": error_msg}), 400
 
-        # 2) Place limit order for TP (opposite side to close position at exact price)
+        # 2) Place conditional TP order (triggers when entry fills and price reaches TP)
+        #    Using set_trading_stop won't work until position exists, so we place a
+        #    reduce-only limit TP now. Bybit will hold it until the entry fills.
         tp_side = "Sell" if side == "Buy" else "Buy"
         logger.info(f"Placing LIMIT {tp_side} TP order: {ticker} qty={quantity} price={tp}")
         try:
@@ -322,35 +334,25 @@ def webhook():
                                   timeInForce="GTC")
             logger.info(f"TP limit order response: {tp_order}")
             if tp_order.get("retCode") == 0:
-                # Track this TP order so we can cancel it if SL hits
                 _tp_orders[ticker] = {
                     "orderId": tp_order["result"].get("orderId", ""),
-                    "side": tp_side,
-                    "qty": str(quantity)
+                    "side": tp_side, "qty": str(quantity)
                 }
             else:
-                logger.warning(f"TP limit order failed: {tp_order.get('retMsg')}, setting TP via trading stop")
-                bybit_call(get_session().set_trading_stop,
-                           category="linear", symbol=ticker,
-                           takeProfit=str(tp), positionIdx=0)
+                logger.warning(f"TP limit order failed: {tp_order.get('retMsg')}")
         except Exception as e:
-            logger.warning(f"TP limit order error: {e}, setting TP via trading stop")
-            try:
-                bybit_call(get_session().set_trading_stop,
-                           category="linear", symbol=ticker,
-                           takeProfit=str(tp), positionIdx=0)
-            except Exception:
-                pass
+            logger.warning(f"TP limit order error: {e}")
 
         trade_record = {
             "id": order["result"].get("orderId", "unknown"),
-            "ticker": ticker, "side": side, "entry": last_price,
+            "ticker": ticker, "side": side, "entry": limit_price,
             "tp": tp, "sl": sl, "quantity": quantity,
             "leverage": leverage, "status": "Open", "pnl": 0.0,
+            "entryType": "limit",
             "timestamp": int(time.time() * 1000)
         }
         trades.append(trade_record)
-        return jsonify({"status": "success", "order": order}), 200
+        return jsonify({"status": "success", "order": order, "entryType": "limit"}), 200
 
     except Exception as e:
         logger.exception(f"Webhook error: {e}")
