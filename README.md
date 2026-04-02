@@ -1,17 +1,19 @@
 # Bybit Money Management Bot
 
-A trading bot that receives webhook signals from TradingView, automatically calculates position sizes based on a target profit, and places orders on Bybit. Includes a React dashboard for monitoring trades in real time.
+A trading bot that receives webhook signals from TradingView, automatically calculates position sizes based on a target profit, and places limit orders on Bybit for both entry and exit — minimizing fees by using maker orders throughout.
 
 ## Features
 
-- Market order entry with limit order take-profit for exact TP fills
+- **Limit order entry** at Fib price (or candle close if more favorable) — maker fees only
+- **Limit order take-profit** placed automatically after entry fills — no taker fees on exit
+- Smart entry price: uses `min(fib, close)` for longs, `max(fib, close)` for shorts
+- Background thread monitors entry fill, then places reduce-only TP limit
+- Auto-cancel orphaned TP limit orders when SL hits (background monitor)
 - Automatic position sizing based on target profit and live market price
 - Leverage configuration per trading pair
-- Auto-cancel orphaned TP limit orders when SL hits (background monitor)
+- 8 preset profiles in Pine Script (P1–P8) + Custom mode
 - Real-time trade monitoring dashboard
 - PnL tracking with Bybit position sync (imports existing positions)
-- Auto-detection of closed positions during sync
-- Failed order tracking with error details
 - Retry with exponential backoff on Bybit rate limits
 - Light/dark theme support
 - Responsive design (mobile/tablet/desktop)
@@ -33,12 +35,24 @@ A trading bot that receives webhook signals from TradingView, automatically calc
 
 ## How It Works
 
-1. TradingView Pine Script detects a setup and places a limit entry at the Fib level
-2. When the limit entry fills, the script sends a webhook with ticker, action, TP, and SL
-3. The bot receives the webhook and:
-   - Places a **market order** to enter the position (with SL attached)
-   - Places a separate **limit order** at the exact TP price (reduceOnly)
-4. A background thread monitors positions every 30s — if SL hits and the position closes, it cancels the orphaned TP limit order
+1. TradingView Pine Script detects a setup and confirmation candle closes
+2. Pine calculates the Fib entry price, TP, and SL
+3. If the candle closed past the Fib level (e.g., below for longs), it uses the close price instead for a better fill
+4. `alert()` fires immediately with JSON containing ticker, entry, tp, sl
+5. The bot receives the webhook and:
+   - Places a **limit entry order** at the signal price (with SL attached)
+   - Spawns a background thread that polls the entry order status
+   - Once the entry fills → places a **reduce-only limit order** at the TP price (opposite side)
+6. A background cleanup thread monitors positions every 30s — if SL hits and the position closes, it cancels the orphaned TP limit order
+
+## Fee Savings
+
+| Order Type | Bybit Fee | Used For |
+|---|---|---|
+| Market (taker) | 0.055% | ❌ Not used |
+| Limit (maker) | 0.02% | ✅ Entry + TP exit |
+
+Both entry and exit use limit orders = maker fees on both sides.
 
 ## Quick Start
 
@@ -84,32 +98,46 @@ docker compose up --build
 | `WEBHOOK_SECRET` | Secret token for webhook auth | — |
 | `ALLOWED_ORIGINS` | CORS allowed origins | `http://localhost:3000` |
 
-## Webhook Usage
+## Webhook Payload
 
-Send a POST request to `/webhook` with the following JSON body:
+The Pine Script sends this JSON via `alert()`:
 
 ```json
 {
-  "ticker": "BTCUSDT",
-  "action": "Buy",
-  "entry": 65000,
-  "tp": 67000,
-  "sl": 64000
+  "ticker": "ETCUSDT",
+  "action": "buy",
+  "entry": 18.45,
+  "tp": 19.20,
+  "sl": 17.80
 }
 ```
 
 - `ticker` (required): Symbol without `.P` suffix
-- `action` (required): `"Buy"` or `"Sell"`
-- `tp` (required): Take profit price — placed as a limit order
-- `sl` (required): Stop loss price — attached to the market entry
-- `entry`: Optional, used for logging. Position sizing uses live market price.
+- `action` (required): `"buy"` or `"sell"`
+- `entry` (required): Limit entry price (Fib level or candle close, whichever is more favorable)
+- `tp` (required): Take profit price — placed as a reduce-only limit after entry fills
+- `sl` (required): Stop loss price — attached to the entry limit order
 
 ## TradingView Setup
 
 1. Copy the Pine Script from `pinescript/4ema_fib_strategy.pine` into TradingView
-2. Create an alert with condition set to **"alert() function calls only"**
-3. Set the webhook URL to `https://your-server/webhook`
-4. The script only sends the webhook when the limit entry actually fills, not on setup confirmation
+2. Create an alert on the strategy
+3. Set condition to **"alert() function calls only"**
+4. Set Message to `{{message}}`
+5. Enable Webhook and set URL to `https://your-server/webhook`
+6. The alert fires on confirmation candle close — no waiting for backtest fills
+
+## Pine Script Presets
+
+| Preset | Description | EMA Lengths | Fib Entry | Fib TP | Fib SL |
+|---|---|---|---|---|---|
+| Custom | Use manual settings | User-defined | User-defined | User-defined | User-defined |
+| P1: Aggressive | Scalping | 306/350/500/530 | 0.746 | 1.908 | -0.315 |
+| P2: Balanced | Day trading | 293/300/800/900 | 0.726 | 1.708 | -0.175 |
+| P3: Conservative | Swing trading | 288/300/600/820 | 0.766 | 1.838 | -0.285 |
+| P4–P8 | Empty slots | Defaults | Defaults | Defaults | Defaults |
+
+P4–P8 use the same defaults as Custom. Edit the Pine Script to set your own values.
 
 ## API Endpoints
 
