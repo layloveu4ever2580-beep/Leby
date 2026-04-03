@@ -326,78 +326,114 @@ def webhook():
         entry_order_id = order["result"].get("orderId", "")
         tp_side = "Sell" if side == "Buy" else "Buy"
 
+        # Round TP price to tick size
+        tp_price = tp
+        try:
+            info = bybit_call(get_session().get_instruments_info, category="linear", symbol=ticker)
+            tick_size = float(info["result"]["list"][0]["priceFilter"]["tickSize"])
+            tp_price = round(round(tp / tick_size) * tick_size, 8)
+        except Exception:
+            tp_price = round(tp, 4)
+
         def _place_tp_sl_after_fill(order_id, sym, tp_s, qty, take_profit, stop_loss):
             """Poll entry order until filled, then place reduce-only TP limit + SL."""
+            logger.info(f"[TP/SL thread] Started for {sym}, entry order {order_id}")
             session = get_session()
-            poll_interval = 3  # seconds
+            poll_interval = 2  # seconds
+            max_polls = 600    # give up after ~20 minutes
 
-            while True:
-                time.sleep(poll_interval)
+            for poll_count in range(max_polls):
+                # Check immediately on first iteration, then wait
+                if poll_count > 0:
+                    time.sleep(poll_interval)
+
                 try:
+                    # Check if order is still open
                     resp = bybit_call(session.get_open_orders,
                                       category="linear", symbol=sym,
                                       orderId=order_id)
                     order_list = resp.get("result", {}).get("list", [])
+                    logger.info(f"[TP/SL thread] Poll #{poll_count} for {sym}: open_orders={len(order_list)}")
 
-                    if not order_list:
-                        # Order no longer open — filled or cancelled
-                        pos = bybit_call(session.get_positions,
-                                         category="linear", symbol=sym)
-                        pos_list = pos.get("result", {}).get("list", [])
-                        has_position = any(float(p.get("size", 0)) > 0 for p in pos_list)
-
-                        if has_position:
-                            # Set SL via trading stop
-                            logger.info(f"Entry filled for {sym}, setting SL @ {stop_loss}")
-                            try:
-                                bybit_call(session.set_trading_stop,
-                                           category="linear", symbol=sym,
-                                           stopLoss=str(stop_loss), positionIdx=0)
-                            except Exception as e:
-                                logger.warning(f"Failed to set SL for {sym}: {e}")
-
-                            # Place TP as reduce-only limit
-                            logger.info(f"Placing TP limit {tp_s} @ {take_profit}")
-                            tp_ord = bybit_call(session.place_order,
-                                                category="linear", symbol=sym, side=tp_s,
-                                                orderType="Limit", qty=str(qty),
-                                                price=str(take_profit), reduceOnly=True,
-                                                timeInForce="GTC")
-                            logger.info(f"TP limit response: {tp_ord}")
-                            if tp_ord.get("retCode") == 0:
-                                _tp_orders[sym] = {
-                                    "orderId": tp_ord["result"].get("orderId", ""),
-                                    "side": tp_s, "qty": str(qty)
-                                }
-                            else:
-                                logger.warning(f"TP limit failed: {tp_ord.get('retMsg')}, using trading stop")
-                                try:
-                                    bybit_call(session.set_trading_stop,
-                                               category="linear", symbol=sym,
-                                               takeProfit=str(take_profit), positionIdx=0)
-                                except Exception as e2:
-                                    logger.error(f"TP trading stop also failed: {e2}")
-                        else:
-                            logger.info(f"Entry order {order_id} for {sym} was cancelled/rejected, no TP/SL needed")
+                    if order_list:
+                        status = order_list[0].get("orderStatus", "")
+                        if status in ("Cancelled", "Rejected", "Deactivated"):
+                            logger.info(f"[TP/SL thread] Entry {order_id} for {sym} status={status}")
                             for t in trades:
                                 if t["id"] == order_id and t["status"] == "Open":
                                     t["status"] = "Cancelled"
-                        return
+                            return
+                        # Still open, keep polling
+                        continue
 
-                    status = order_list[0].get("orderStatus", "")
-                    if status in ("Cancelled", "Rejected", "Deactivated"):
-                        logger.info(f"Entry {order_id} for {sym} status={status}, no TP/SL needed")
+                    # Order no longer in open list — check if position exists
+                    logger.info(f"[TP/SL thread] Entry order gone from open list, checking position for {sym}")
+                    pos = bybit_call(session.get_positions,
+                                     category="linear", symbol=sym)
+                    pos_list = pos.get("result", {}).get("list", [])
+                    position_size = 0.0
+                    for p in pos_list:
+                        s = float(p.get("size", 0))
+                        if s > 0:
+                            position_size = s
+                            break
+
+                    if position_size > 0:
+                        logger.info(f"[TP/SL thread] Position confirmed for {sym} size={position_size}")
+
+                        # Set SL via trading stop
+                        try:
+                            sl_resp = bybit_call(session.set_trading_stop,
+                                                 category="linear", symbol=sym,
+                                                 stopLoss=str(stop_loss), positionIdx=0)
+                            logger.info(f"[TP/SL thread] SL response: {sl_resp}")
+                        except Exception as e:
+                            logger.error(f"[TP/SL thread] Failed to set SL for {sym}: {e}")
+
+                        # Place TP as reduce-only limit (use position size for exact match)
+                        tp_qty = str(position_size)
+                        logger.info(f"[TP/SL thread] Placing TP limit {tp_s} {sym} qty={tp_qty} @ {take_profit}")
+                        try:
+                            tp_ord = bybit_call(session.place_order,
+                                                category="linear", symbol=sym, side=tp_s,
+                                                orderType="Limit", qty=tp_qty,
+                                                price=str(take_profit), reduceOnly=True,
+                                                timeInForce="GTC")
+                            logger.info(f"[TP/SL thread] TP limit response: {tp_ord}")
+                            if tp_ord.get("retCode") == 0:
+                                _tp_orders[sym] = {
+                                    "orderId": tp_ord["result"].get("orderId", ""),
+                                    "side": tp_s, "qty": tp_qty
+                                }
+                            else:
+                                logger.warning(f"[TP/SL thread] TP limit failed: {tp_ord.get('retMsg')}, trying trading stop")
+                                bybit_call(session.set_trading_stop,
+                                           category="linear", symbol=sym,
+                                           takeProfit=str(take_profit), positionIdx=0)
+                        except Exception as e:
+                            logger.error(f"[TP/SL thread] TP order error: {e}, trying trading stop")
+                            try:
+                                bybit_call(session.set_trading_stop,
+                                           category="linear", symbol=sym,
+                                           takeProfit=str(take_profit), positionIdx=0)
+                            except Exception as e2:
+                                logger.error(f"[TP/SL thread] TP trading stop also failed: {e2}")
+                        return
+                    else:
+                        logger.info(f"[TP/SL thread] No position for {sym}, entry was cancelled")
                         for t in trades:
                             if t["id"] == order_id and t["status"] == "Open":
                                 t["status"] = "Cancelled"
                         return
 
                 except Exception as e:
-                    logger.warning(f"Error polling entry order {order_id}: {e}")
+                    logger.error(f"[TP/SL thread] Error polling {sym}: {e}")
+
+            logger.warning(f"[TP/SL thread] Gave up polling for {sym} after {max_polls} attempts")
 
         threading.Thread(
             target=_place_tp_sl_after_fill,
-            args=(entry_order_id, ticker, tp_side, quantity, tp, sl),
+            args=(entry_order_id, ticker, tp_side, quantity, tp_price, sl),
             daemon=True
         ).start()
 
