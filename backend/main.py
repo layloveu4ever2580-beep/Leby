@@ -478,17 +478,30 @@ def update_trade_tp(trade_id):
 @app.route("/api/sync-trades", methods=["POST"])
 def sync_trades():
     try:
-        positions = bybit_call(get_session().get_positions,
-                               category="linear", settleCoin="USDT")
+        session = get_session()
 
-        if positions.get("retCode", -1) != 0:
-            error_msg = positions.get("retMsg", "Bybit API error")
-            logger.error(f"sync_trades Bybit error: {error_msg}")
-            return jsonify({"error": error_msg}), 502
+        # Fetch all positions with pagination support
+        all_positions = []
+        cursor = ""
+        while True:
+            params = {"category": "linear", "settleCoin": "USDT", "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            positions = bybit_call(session.get_positions, **params)
 
-        position_list = positions.get("result", {}).get("list", [])
+            if positions.get("retCode", -1) != 0:
+                error_msg = positions.get("retMsg", "Bybit API error")
+                logger.error(f"sync_trades Bybit error: {error_msg}")
+                return jsonify({"error": error_msg}), 502
 
-        for pos in position_list:
+            position_list = positions.get("result", {}).get("list", [])
+            all_positions.extend(position_list)
+
+            cursor = positions.get("result", {}).get("nextPageCursor", "")
+            if not cursor:
+                break
+
+        for pos in all_positions:
             size = float(pos.get("size", 0))
             if size == 0:
                 continue
@@ -503,27 +516,33 @@ def sync_trades():
                     matched = True
 
             if not matched:
+                created = pos.get("createdTime", "")
+                try:
+                    ts = int(float(created)) if created else int(time.time() * 1000)
+                except (ValueError, TypeError):
+                    ts = int(time.time() * 1000)
+
                 trades.append({
                     "id": f"synced-{symbol}-{int(time.time())}",
                     "ticker": symbol,
                     "side": pos.get("side", "Buy"),
                     "entry": float(pos.get("avgPrice", 0)),
-                    "tp": float(pos.get("takeProfit", 0)),
-                    "sl": float(pos.get("stopLoss", 0)),
+                    "tp": float(pos.get("takeProfit", 0) or 0),
+                    "sl": float(pos.get("stopLoss", 0) or 0),
                     "quantity": size,
-                    "leverage": int(float(pos.get("leverage", 1))),
+                    "leverage": int(float(pos.get("leverage", 1) or 1)),
                     "status": "Open",
                     "pnl": unrealised_pnl,
-                    "timestamp": int(float(pos.get("createdTime", time.time() * 1000)))
+                    "timestamp": ts
                 })
 
-        open_symbols = {pos.get("symbol") for pos in position_list if float(pos.get("size", 0)) > 0}
+        open_symbols = {pos.get("symbol") for pos in all_positions if float(pos.get("size", 0)) > 0}
         for t in trades:
             if t["status"] == "Open" and t["ticker"] not in open_symbols:
                 t["status"] = "Closed"
 
-        logger.info(f"Synced {len(position_list)} positions from Bybit")
-        return jsonify({"status": "synced", "positions": len(position_list)}), 200
+        logger.info(f"Synced {len(all_positions)} positions from Bybit")
+        return jsonify({"status": "synced", "positions": len(all_positions)}), 200
     except Exception as e:
         logger.exception(f"sync_trades error: {e}")
         return jsonify({"error": str(e)}), 500
