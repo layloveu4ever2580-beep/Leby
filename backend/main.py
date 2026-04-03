@@ -104,50 +104,141 @@ trades = []
 # Track TP limit orders: { symbol: { "orderId": "...", "side": "Sell", "qty": "..." } }
 _tp_orders = {}
 
+# Track pending entry orders that need TP/SL set after fill
+# { orderId: { "symbol": "...", "side": "Buy", "tp": 123.4, "sl": 100.0, "tp_side": "Sell", "qty": "..." } }
+_pending_entries = {}
 
-def cleanup_orphaned_tp_orders():
-    """Background task: cancel TP limit orders for positions that no longer exist (SL hit)."""
+
+def background_monitor():
+    """Single background loop that handles:
+    1. Setting TP limit + SL on positions after entry limit fills
+    2. Cancelling orphaned TP orders when SL hits (position closed)
+    """
     while True:
         try:
-            time.sleep(30)
-            if not _tp_orders:
-                continue
-
+            time.sleep(5)
             session = get_session()
-            positions = bybit_call(session.get_positions, category="linear", settleCoin="USDT")
-            if positions.get("retCode") != 0:
-                continue
 
-            position_list = positions.get("result", {}).get("list", [])
-            open_symbols = {p.get("symbol") for p in position_list if float(p.get("size", 0)) > 0}
-
-            # Find TP orders for closed positions
-            symbols_to_cancel = [sym for sym in list(_tp_orders.keys()) if sym not in open_symbols]
-
-            for sym in symbols_to_cancel:
-                tp_info = _tp_orders.pop(sym, None)
-                if tp_info:
+            # ── PART 1: Check pending entries for fills ──
+            if _pending_entries:
+                pending_copy = dict(_pending_entries)
+                for order_id, info in pending_copy.items():
+                    sym = info["symbol"]
                     try:
-                        logger.info(f"SL hit detected for {sym}, cancelling TP limit order {tp_info['orderId']}")
-                        bybit_call(session.cancel_order,
-                                   category="linear", symbol=sym,
-                                   orderId=tp_info["orderId"])
-                        logger.info(f"TP order cancelled for {sym}")
+                        # Check if entry order is still open
+                        resp = bybit_call(session.get_open_orders,
+                                          category="linear", symbol=sym,
+                                          orderId=order_id)
+                        order_list = resp.get("result", {}).get("list", [])
 
-                        # Update trade status
-                        for t in trades:
-                            if t["ticker"] == sym and t["status"] == "Open":
-                                t["status"] = "Closed"
+                        if order_list:
+                            status = order_list[0].get("orderStatus", "")
+                            if status in ("Cancelled", "Rejected", "Deactivated"):
+                                logger.info(f"[monitor] Entry {order_id} for {sym} was {status}")
+                                _pending_entries.pop(order_id, None)
+                                for t in trades:
+                                    if t["id"] == order_id and t["status"] == "Open":
+                                        t["status"] = "Cancelled"
+                            continue  # Still open, check next time
+
+                        # Order gone from open list — check position
+                        pos = bybit_call(session.get_positions,
+                                         category="linear", symbol=sym)
+                        pos_list = pos.get("result", {}).get("list", [])
+                        position_size = 0.0
+                        for p in pos_list:
+                            s = float(p.get("size", 0))
+                            if s > 0:
+                                position_size = s
+                                break
+
+                        if position_size <= 0:
+                            logger.info(f"[monitor] No position for {sym}, entry cancelled")
+                            _pending_entries.pop(order_id, None)
+                            for t in trades:
+                                if t["id"] == order_id and t["status"] == "Open":
+                                    t["status"] = "Cancelled"
+                            continue
+
+                        # Position exists — set SL and place TP limit
+                        logger.info(f"[monitor] Entry filled for {sym}, size={position_size}")
+                        _pending_entries.pop(order_id, None)
+
+                        # Set SL
+                        try:
+                            sl_resp = bybit_call(session.set_trading_stop,
+                                                 category="linear", symbol=sym,
+                                                 stopLoss=str(info["sl"]), positionIdx=0)
+                            logger.info(f"[monitor] SL set for {sym}: {sl_resp.get('retCode')} {sl_resp.get('retMsg')}")
+                        except Exception as e:
+                            logger.error(f"[monitor] SL failed for {sym}: {e}")
+
+                        # Place TP reduce-only limit
+                        tp_qty = str(position_size)
+                        try:
+                            tp_ord = bybit_call(session.place_order,
+                                                category="linear", symbol=sym,
+                                                side=info["tp_side"],
+                                                orderType="Limit", qty=tp_qty,
+                                                price=str(info["tp"]),
+                                                reduceOnly=True, timeInForce="GTC")
+                            logger.info(f"[monitor] TP limit for {sym}: {tp_ord.get('retCode')} {tp_ord.get('retMsg')}")
+                            if tp_ord.get("retCode") == 0:
+                                _tp_orders[sym] = {
+                                    "orderId": tp_ord["result"].get("orderId", ""),
+                                    "side": info["tp_side"], "qty": tp_qty
+                                }
+                            else:
+                                # Fallback: set TP via trading stop
+                                logger.warning(f"[monitor] TP limit failed, using trading stop for {sym}")
+                                bybit_call(session.set_trading_stop,
+                                           category="linear", symbol=sym,
+                                           takeProfit=str(info["tp"]), positionIdx=0)
+                        except Exception as e:
+                            logger.error(f"[monitor] TP order error for {sym}: {e}")
+                            try:
+                                bybit_call(session.set_trading_stop,
+                                           category="linear", symbol=sym,
+                                           takeProfit=str(info["tp"]), positionIdx=0)
+                            except Exception:
+                                pass
+
                     except Exception as e:
-                        logger.warning(f"Failed to cancel TP order for {sym}: {e}")
+                        logger.error(f"[monitor] Error checking entry {order_id}: {e}")
+
+            # ── PART 2: Cancel orphaned TP orders (SL hit) ──
+            if _tp_orders:
+                try:
+                    positions = bybit_call(session.get_positions,
+                                           category="linear", settleCoin="USDT")
+                    if positions.get("retCode") == 0:
+                        position_list = positions.get("result", {}).get("list", [])
+                        open_symbols = {p.get("symbol") for p in position_list
+                                        if float(p.get("size", 0)) > 0}
+
+                        for sym in [s for s in list(_tp_orders.keys()) if s not in open_symbols]:
+                            tp_info = _tp_orders.pop(sym, None)
+                            if tp_info:
+                                try:
+                                    logger.info(f"[monitor] SL hit for {sym}, cancelling TP {tp_info['orderId']}")
+                                    bybit_call(session.cancel_order,
+                                               category="linear", symbol=sym,
+                                               orderId=tp_info["orderId"])
+                                    for t in trades:
+                                        if t["ticker"] == sym and t["status"] == "Open":
+                                            t["status"] = "Closed"
+                                except Exception as e:
+                                    logger.warning(f"[monitor] Cancel TP failed for {sym}: {e}")
+                except Exception as e:
+                    logger.warning(f"[monitor] Orphan cleanup error: {e}")
 
         except Exception as e:
-            logger.warning(f"TP cleanup error: {e}")
+            logger.warning(f"[monitor] Loop error: {e}")
 
 
-# Start background cleanup thread
-_cleanup_thread = threading.Thread(target=cleanup_orphaned_tp_orders, daemon=True)
-_cleanup_thread.start()
+# Start single background monitor thread
+_monitor_thread = threading.Thread(target=background_monitor, daemon=True)
+_monitor_thread.start()
 
 
 @app.route("/health", methods=["GET"])
@@ -321,8 +412,7 @@ def webhook():
             })
             return jsonify({"error": error_msg}), 400
 
-        # 2) Monitor entry fill in background, then place SL + TP
-        #    Can't place reduce-only TP or set trading stop until position exists.
+        # 2) Track this entry so the background monitor sets TP/SL after fill
         entry_order_id = order["result"].get("orderId", "")
         tp_side = "Sell" if side == "Buy" else "Buy"
 
@@ -335,107 +425,15 @@ def webhook():
         except Exception:
             tp_price = round(tp, 4)
 
-        def _place_tp_sl_after_fill(order_id, sym, tp_s, qty, take_profit, stop_loss):
-            """Poll entry order until filled, then place reduce-only TP limit + SL."""
-            logger.info(f"[TP/SL thread] Started for {sym}, entry order {order_id}")
-            session = get_session()
-            poll_interval = 2  # seconds
-            max_polls = 600    # give up after ~20 minutes
-
-            for poll_count in range(max_polls):
-                # Check immediately on first iteration, then wait
-                if poll_count > 0:
-                    time.sleep(poll_interval)
-
-                try:
-                    # Check if order is still open
-                    resp = bybit_call(session.get_open_orders,
-                                      category="linear", symbol=sym,
-                                      orderId=order_id)
-                    order_list = resp.get("result", {}).get("list", [])
-                    logger.info(f"[TP/SL thread] Poll #{poll_count} for {sym}: open_orders={len(order_list)}")
-
-                    if order_list:
-                        status = order_list[0].get("orderStatus", "")
-                        if status in ("Cancelled", "Rejected", "Deactivated"):
-                            logger.info(f"[TP/SL thread] Entry {order_id} for {sym} status={status}")
-                            for t in trades:
-                                if t["id"] == order_id and t["status"] == "Open":
-                                    t["status"] = "Cancelled"
-                            return
-                        # Still open, keep polling
-                        continue
-
-                    # Order no longer in open list — check if position exists
-                    logger.info(f"[TP/SL thread] Entry order gone from open list, checking position for {sym}")
-                    pos = bybit_call(session.get_positions,
-                                     category="linear", symbol=sym)
-                    pos_list = pos.get("result", {}).get("list", [])
-                    position_size = 0.0
-                    for p in pos_list:
-                        s = float(p.get("size", 0))
-                        if s > 0:
-                            position_size = s
-                            break
-
-                    if position_size > 0:
-                        logger.info(f"[TP/SL thread] Position confirmed for {sym} size={position_size}")
-
-                        # Set SL via trading stop
-                        try:
-                            sl_resp = bybit_call(session.set_trading_stop,
-                                                 category="linear", symbol=sym,
-                                                 stopLoss=str(stop_loss), positionIdx=0)
-                            logger.info(f"[TP/SL thread] SL response: {sl_resp}")
-                        except Exception as e:
-                            logger.error(f"[TP/SL thread] Failed to set SL for {sym}: {e}")
-
-                        # Place TP as reduce-only limit (use position size for exact match)
-                        tp_qty = str(position_size)
-                        logger.info(f"[TP/SL thread] Placing TP limit {tp_s} {sym} qty={tp_qty} @ {take_profit}")
-                        try:
-                            tp_ord = bybit_call(session.place_order,
-                                                category="linear", symbol=sym, side=tp_s,
-                                                orderType="Limit", qty=tp_qty,
-                                                price=str(take_profit), reduceOnly=True,
-                                                timeInForce="GTC")
-                            logger.info(f"[TP/SL thread] TP limit response: {tp_ord}")
-                            if tp_ord.get("retCode") == 0:
-                                _tp_orders[sym] = {
-                                    "orderId": tp_ord["result"].get("orderId", ""),
-                                    "side": tp_s, "qty": tp_qty
-                                }
-                            else:
-                                logger.warning(f"[TP/SL thread] TP limit failed: {tp_ord.get('retMsg')}, trying trading stop")
-                                bybit_call(session.set_trading_stop,
-                                           category="linear", symbol=sym,
-                                           takeProfit=str(take_profit), positionIdx=0)
-                        except Exception as e:
-                            logger.error(f"[TP/SL thread] TP order error: {e}, trying trading stop")
-                            try:
-                                bybit_call(session.set_trading_stop,
-                                           category="linear", symbol=sym,
-                                           takeProfit=str(take_profit), positionIdx=0)
-                            except Exception as e2:
-                                logger.error(f"[TP/SL thread] TP trading stop also failed: {e2}")
-                        return
-                    else:
-                        logger.info(f"[TP/SL thread] No position for {sym}, entry was cancelled")
-                        for t in trades:
-                            if t["id"] == order_id and t["status"] == "Open":
-                                t["status"] = "Cancelled"
-                        return
-
-                except Exception as e:
-                    logger.error(f"[TP/SL thread] Error polling {sym}: {e}")
-
-            logger.warning(f"[TP/SL thread] Gave up polling for {sym} after {max_polls} attempts")
-
-        threading.Thread(
-            target=_place_tp_sl_after_fill,
-            args=(entry_order_id, ticker, tp_side, quantity, tp_price, sl),
-            daemon=True
-        ).start()
+        _pending_entries[entry_order_id] = {
+            "symbol": ticker,
+            "side": side,
+            "tp": tp_price,
+            "sl": sl,
+            "tp_side": tp_side,
+            "qty": str(quantity),
+        }
+        logger.info(f"Entry {entry_order_id} added to pending monitor for {ticker}")
 
         trade_record = {
             "id": order["result"].get("orderId", "unknown"),
