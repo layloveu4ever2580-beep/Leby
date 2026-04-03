@@ -95,7 +95,7 @@ def round_qty(qty, min_qty, qty_step):
 
 
 settings = {
-    "targetProfit": 30.0,
+    "targetProfit": 40.0,
     "theme": "dark",
     "timezone": "UTC",
 }
