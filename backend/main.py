@@ -43,12 +43,10 @@ def get_session():
 
 
 def bybit_call(fn, *args, retries=3, **kwargs):
-    """Call a Bybit API function with retry on rate limit (ErrCode 403 / 10006)."""
+    """Call a Bybit API function with retry on rate limit."""
     for attempt in range(retries):
         try:
             result = fn(*args, **kwargs)
-            # pybit raises exceptions for HTTP errors, but some rate limits
-            # come back as retCode != 0 in the JSON response
             ret_code = result.get("retCode", 0) if isinstance(result, dict) else 0
             if ret_code in (10006, 403):
                 wait = 2 ** attempt + 1
@@ -60,15 +58,13 @@ def bybit_call(fn, *args, retries=3, **kwargs):
             err_str = str(e)
             if "rate limit" in err_str.lower() or "403" in err_str or "10006" in err_str:
                 wait = 2 ** attempt + 1
-                logger.warning(f"Rate limited (exception), retry {attempt+1}/{retries} in {wait}s: {err_str[:100]}")
+                logger.warning(f"Rate limited, retry {attempt+1}/{retries} in {wait}s")
                 time.sleep(wait)
                 continue
             raise
-    # Final attempt — let it raise naturally
     return fn(*args, **kwargs)
 
 
-# Cache symbol info to avoid repeated API calls
 _symbol_cache = {}
 
 
@@ -85,6 +81,18 @@ def get_symbol_info(symbol):
         return min_qty, qty_step
     except Exception:
         return 0.001, 0.001
+
+
+def get_tick_size(symbol):
+    try:
+        info = bybit_call(get_session().get_instruments_info, category="linear", symbol=symbol)
+        return float(info["result"]["list"][0]["priceFilter"]["tickSize"])
+    except Exception:
+        return 0.01
+
+
+def round_price(price, tick_size):
+    return round(round(price / tick_size) * tick_size, 8)
 
 
 def round_qty(qty, min_qty, qty_step):
@@ -104,123 +112,106 @@ trades = []
 # Track TP limit orders: { symbol: { "orderId": "...", "side": "Sell", "qty": "..." } }
 _tp_orders = {}
 
-# Track pending entry orders that need TP/SL set after fill
-# { orderId: { "symbol": "...", "side": "Buy", "tp": 123.4, "sl": 100.0, "tp_side": "Sell", "qty": "..." } }
+# Pending entries waiting for fill to place TP limit
+# { orderId: { "symbol", "tp_side", "tp_price", "qty" } }
 _pending_entries = {}
 
 
 def background_monitor():
-    """Single background loop that handles:
-    1. Setting TP limit + SL on positions after entry limit fills
-    2. Cancelling orphaned TP orders when SL hits (position closed)
+    """Background loop every 5s:
+    1. Check pending entries — if filled, place TP reduce-only limit
+    2. Cancel orphaned TP orders when SL hits
     """
     while True:
         try:
             time.sleep(5)
             session = get_session()
 
-            # ── PART 1: Check pending entries for fills ──
+            # ── Check pending entries for fills ──
             if _pending_entries:
-                pending_copy = dict(_pending_entries)
-                for order_id, info in pending_copy.items():
+                for order_id in list(_pending_entries.keys()):
+                    info = _pending_entries.get(order_id)
+                    if not info:
+                        continue
                     sym = info["symbol"]
                     try:
-                        # Check if entry order is still open
                         resp = bybit_call(session.get_open_orders,
                                           category="linear", symbol=sym,
                                           orderId=order_id)
                         order_list = resp.get("result", {}).get("list", [])
 
                         if order_list:
-                            status = order_list[0].get("orderStatus", "")
-                            if status in ("Cancelled", "Rejected", "Deactivated"):
-                                logger.info(f"[monitor] Entry {order_id} for {sym} was {status}")
+                            st = order_list[0].get("orderStatus", "")
+                            if st in ("Cancelled", "Rejected", "Deactivated"):
+                                logger.info(f"[monitor] Entry {order_id} {sym} was {st}")
                                 _pending_entries.pop(order_id, None)
                                 for t in trades:
                                     if t["id"] == order_id and t["status"] == "Open":
                                         t["status"] = "Cancelled"
-                            continue  # Still open, check next time
+                            continue  # still open
 
-                        # Order gone from open list — check position
+                        # Order gone — check if position exists
                         pos = bybit_call(session.get_positions,
                                          category="linear", symbol=sym)
                         pos_list = pos.get("result", {}).get("list", [])
-                        position_size = 0.0
+                        pos_size = 0.0
                         for p in pos_list:
                             s = float(p.get("size", 0))
                             if s > 0:
-                                position_size = s
+                                pos_size = s
                                 break
 
-                        if position_size <= 0:
-                            logger.info(f"[monitor] No position for {sym}, entry cancelled")
-                            _pending_entries.pop(order_id, None)
+                        _pending_entries.pop(order_id, None)
+
+                        if pos_size <= 0:
+                            logger.info(f"[monitor] No position for {sym}, entry was cancelled")
                             for t in trades:
                                 if t["id"] == order_id and t["status"] == "Open":
                                     t["status"] = "Cancelled"
                             continue
 
-                        # Position exists — set SL and place TP limit
-                        logger.info(f"[monitor] Entry filled for {sym}, size={position_size}")
-                        _pending_entries.pop(order_id, None)
-
-                        # Set SL
-                        try:
-                            sl_resp = bybit_call(session.set_trading_stop,
-                                                 category="linear", symbol=sym,
-                                                 stopLoss=str(info["sl"]), positionIdx=0)
-                            logger.info(f"[monitor] SL set for {sym}: {sl_resp.get('retCode')} {sl_resp.get('retMsg')}")
-                        except Exception as e:
-                            logger.error(f"[monitor] SL failed for {sym}: {e}")
-
-                        # Place TP reduce-only limit
-                        tp_qty = str(position_size)
-                        try:
-                            tp_ord = bybit_call(session.place_order,
-                                                category="linear", symbol=sym,
-                                                side=info["tp_side"],
-                                                orderType="Limit", qty=tp_qty,
-                                                price=str(info["tp"]),
-                                                reduceOnly=True, timeInForce="GTC")
-                            logger.info(f"[monitor] TP limit for {sym}: {tp_ord.get('retCode')} {tp_ord.get('retMsg')}")
-                            if tp_ord.get("retCode") == 0:
-                                _tp_orders[sym] = {
-                                    "orderId": tp_ord["result"].get("orderId", ""),
-                                    "side": info["tp_side"], "qty": tp_qty
-                                }
-                            else:
-                                # Fallback: set TP via trading stop
-                                logger.warning(f"[monitor] TP limit failed, using trading stop for {sym}")
-                                bybit_call(session.set_trading_stop,
-                                           category="linear", symbol=sym,
-                                           takeProfit=str(info["tp"]), positionIdx=0)
-                        except Exception as e:
-                            logger.error(f"[monitor] TP order error for {sym}: {e}")
+                        # Position exists — place TP limit
+                        tp_qty = str(pos_size)
+                        logger.info(f"[monitor] Entry filled {sym}, placing TP {info['tp_side']} limit qty={tp_qty} @ {info['tp_price']}")
+                        tp_ord = bybit_call(session.place_order,
+                                            category="linear", symbol=sym,
+                                            side=info["tp_side"],
+                                            orderType="Limit", qty=tp_qty,
+                                            price=str(info["tp_price"]),
+                                            reduceOnly=True, timeInForce="GTC")
+                        logger.info(f"[monitor] TP response: retCode={tp_ord.get('retCode')} retMsg={tp_ord.get('retMsg')}")
+                        if tp_ord.get("retCode") == 0:
+                            _tp_orders[sym] = {
+                                "orderId": tp_ord["result"].get("orderId", ""),
+                                "side": info["tp_side"], "qty": tp_qty
+                            }
+                        else:
+                            # Fallback to trading stop TP
+                            logger.warning(f"[monitor] TP limit failed, using trading stop for {sym}")
                             try:
                                 bybit_call(session.set_trading_stop,
                                            category="linear", symbol=sym,
-                                           takeProfit=str(info["tp"]), positionIdx=0)
-                            except Exception:
-                                pass
+                                           takeProfit=str(info["tp_price"]), positionIdx=0)
+                            except Exception as e2:
+                                logger.error(f"[monitor] Trading stop TP also failed for {sym}: {e2}")
 
                     except Exception as e:
                         logger.error(f"[monitor] Error checking entry {order_id}: {e}")
 
-            # ── PART 2: Cancel orphaned TP orders (SL hit) ──
+            # ── Cancel orphaned TP orders (SL hit) ──
             if _tp_orders:
                 try:
                     positions = bybit_call(session.get_positions,
                                            category="linear", settleCoin="USDT")
                     if positions.get("retCode") == 0:
-                        position_list = positions.get("result", {}).get("list", [])
-                        open_symbols = {p.get("symbol") for p in position_list
-                                        if float(p.get("size", 0)) > 0}
-
-                        for sym in [s for s in list(_tp_orders.keys()) if s not in open_symbols]:
+                        pos_list = positions.get("result", {}).get("list", [])
+                        open_syms = {p.get("symbol") for p in pos_list
+                                     if float(p.get("size", 0)) > 0}
+                        for sym in [s for s in list(_tp_orders.keys()) if s not in open_syms]:
                             tp_info = _tp_orders.pop(sym, None)
                             if tp_info:
                                 try:
-                                    logger.info(f"[monitor] SL hit for {sym}, cancelling TP {tp_info['orderId']}")
+                                    logger.info(f"[monitor] SL hit {sym}, cancelling TP {tp_info['orderId']}")
                                     bybit_call(session.cancel_order,
                                                category="linear", symbol=sym,
                                                orderId=tp_info["orderId"])
@@ -228,15 +219,14 @@ def background_monitor():
                                         if t["ticker"] == sym and t["status"] == "Open":
                                             t["status"] = "Closed"
                                 except Exception as e:
-                                    logger.warning(f"[monitor] Cancel TP failed for {sym}: {e}")
+                                    logger.warning(f"[monitor] Cancel TP failed {sym}: {e}")
                 except Exception as e:
-                    logger.warning(f"[monitor] Orphan cleanup error: {e}")
+                    logger.warning(f"[monitor] Orphan check error: {e}")
 
         except Exception as e:
             logger.warning(f"[monitor] Loop error: {e}")
 
 
-# Start single background monitor thread
 _monitor_thread = threading.Thread(target=background_monitor, daemon=True)
 _monitor_thread.start()
 
@@ -248,53 +238,36 @@ def health():
 
 @app.route("/api/test-bybit", methods=["GET"])
 def test_bybit():
-    """Diagnostic endpoint: test Bybit API connectivity from this server."""
     results = {}
     session = get_session()
-
-    # Test 1: Server time (public, no auth)
     try:
         resp = session.get_server_time()
-        results["server_time"] = {"status": "ok", "retCode": resp.get("retCode"), "data": resp.get("result")}
+        results["server_time"] = {"status": "ok", "retCode": resp.get("retCode")}
     except Exception as e:
         results["server_time"] = {"status": "error", "error": str(e)}
-
-    # Test 2: Ticker price (public, no auth)
     try:
         resp = session.get_tickers(category="linear", symbol="BTCUSDT")
         price = resp["result"]["list"][0]["lastPrice"] if resp.get("retCode") == 0 else None
-        results["ticker"] = {"status": "ok", "retCode": resp.get("retCode"), "retMsg": resp.get("retMsg"), "price": price}
+        results["ticker"] = {"status": "ok", "price": price}
     except Exception as e:
         results["ticker"] = {"status": "error", "error": str(e)}
-
-    # Test 3: Wallet balance (authenticated)
     try:
         resp = session.get_wallet_balance(accountType="UNIFIED")
-        results["wallet"] = {"status": "ok", "retCode": resp.get("retCode"), "retMsg": resp.get("retMsg")}
-        if resp.get("retCode") == 0:
-            coins = resp.get("result", {}).get("list", [])
-            results["wallet"]["accounts"] = len(coins)
+        results["wallet"] = {"status": "ok", "retCode": resp.get("retCode")}
     except Exception as e:
         results["wallet"] = {"status": "error", "error": str(e)}
-
-    # Test 4: Positions (authenticated)
     try:
         resp = session.get_positions(category="linear", settleCoin="USDT")
-        results["positions"] = {"status": "ok", "retCode": resp.get("retCode"), "retMsg": resp.get("retMsg")}
         if resp.get("retCode") == 0:
             pos_list = resp.get("result", {}).get("list", [])
             open_pos = [p for p in pos_list if float(p.get("size", 0)) > 0]
-            results["positions"]["total"] = len(pos_list)
-            results["positions"]["open"] = len(open_pos)
+            results["positions"] = {"status": "ok", "total": len(pos_list), "open": len(open_pos)}
     except Exception as e:
         results["positions"] = {"status": "error", "error": str(e)}
-
-    # Test 5: API key info
     results["config"] = {
         "api_key_prefix": BYBIT_API_KEY[:6] + "..." if len(BYBIT_API_KEY) > 6 else "(not set)",
         "testnet": BYBIT_TESTNET,
     }
-
     return jsonify(results), 200
 
 
@@ -318,7 +291,6 @@ def update_settings():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Authenticate: check header OR JSON body field (TradingView can't send headers)
     if WEBHOOK_SECRET and WEBHOOK_SECRET != "your_webhook_secret_here":
         token = request.headers.get("X-Webhook-Secret", "")
         if token != WEBHOOK_SECRET:
@@ -329,7 +301,6 @@ def webhook():
     try:
         data = request.get_json(silent=True)
         if data is None:
-            # Try to parse raw text — "Order fills only" may send the comment as plain text
             raw = request.get_data(as_text=True).strip()
             logger.info(f"Raw webhook body: {raw[:500]}")
             if raw.startswith("{"):
@@ -356,7 +327,6 @@ def webhook():
         if not all([ticker, tp, sl]):
             return jsonify({"error": "Missing parameters (ticker, tp, sl required)"}), 400
 
-        # Fetch market price with retry
         ticker_info = bybit_call(get_session().get_tickers, category="linear", symbol=ticker)
         last_price = float(ticker_info["result"]["list"][0]["lastPrice"])
         logger.info(f"{ticker} last_price={last_price}, entry={entry}, tp={tp}, sl={sl}, side={side}")
@@ -364,17 +334,16 @@ def webhook():
         price_for_calc = last_price if last_price > 0 else entry
         tp_distance = abs(price_for_calc - tp)
         if tp_distance == 0:
-            return jsonify({"error": "TP distance is zero, cannot calculate quantity"}), 400
+            return jsonify({"error": "TP distance is zero"}), 400
 
-        target_profit = settings.get("targetProfit", 100.0)
+        target_profit = settings.get("targetProfit", 40.0)
         raw_quantity = target_profit / tp_distance
         leverage = LEVERAGE_CONFIG.get(ticker, 10)
 
         min_qty, qty_step = get_symbol_info(ticker)
         quantity = round_qty(raw_quantity, min_qty, qty_step)
-        logger.info(f"Calculated qty={quantity} (raw={raw_quantity}, min={min_qty}, step={qty_step})")
+        logger.info(f"qty={quantity} (raw={raw_quantity}, min={min_qty}, step={qty_step})")
 
-        # Set leverage (ignore errors if already set)
         try:
             bybit_call(get_session().set_leverage,
                        category="linear", symbol=ticker,
@@ -382,27 +351,22 @@ def webhook():
         except Exception as e:
             logger.info(f"set_leverage note: {e}")
 
-        # Round entry price to tick size
-        limit_price = entry
-        try:
-            info = bybit_call(get_session().get_instruments_info, category="linear", symbol=ticker)
-            tick_size = float(info["result"]["list"][0]["priceFilter"]["tickSize"])
-            limit_price = round(round(limit_price / tick_size) * tick_size, 8)
-        except Exception:
-            limit_price = round(limit_price, 4)
+        tick_size = get_tick_size(ticker)
+        limit_price = round_price(entry, tick_size)
+        tp_price = round_price(tp, tick_size)
 
-        # 1) LIMIT order to ENTER position
-        logger.info(f"Placing LIMIT {side} entry: {ticker} qty={quantity} price={limit_price} sl={sl}")
+        # Place LIMIT entry with SL attached
+        logger.info(f"Placing LIMIT {side}: {ticker} qty={quantity} price={limit_price} sl={sl}")
         order = bybit_call(get_session().place_order,
                            category="linear", symbol=ticker, side=side,
                            orderType="Limit", qty=str(quantity),
-                           price=str(limit_price),
+                           price=str(limit_price), stopLoss=str(sl),
                            timeInForce="GTC")
-        logger.info(f"Limit entry response: {order}")
+        logger.info(f"Entry response: {order}")
 
         if order.get("retCode", -1) != 0:
-            error_msg = order.get("retMsg", "Unknown Bybit error")
-            logger.error(f"Bybit limit entry rejected: {error_msg}")
+            error_msg = order.get("retMsg", "Unknown error")
+            logger.error(f"Entry rejected: {error_msg}")
             trades.append({
                 "id": "failed", "ticker": ticker, "side": side,
                 "entry": limit_price, "tp": tp, "sl": sl,
@@ -412,38 +376,25 @@ def webhook():
             })
             return jsonify({"error": error_msg}), 400
 
-        # 2) Track this entry so the background monitor sets TP/SL after fill
+        # Track entry so monitor places TP limit after fill
         entry_order_id = order["result"].get("orderId", "")
         tp_side = "Sell" if side == "Buy" else "Buy"
-
-        # Round TP price to tick size
-        tp_price = tp
-        try:
-            info = bybit_call(get_session().get_instruments_info, category="linear", symbol=ticker)
-            tick_size = float(info["result"]["list"][0]["priceFilter"]["tickSize"])
-            tp_price = round(round(tp / tick_size) * tick_size, 8)
-        except Exception:
-            tp_price = round(tp, 4)
-
         _pending_entries[entry_order_id] = {
             "symbol": ticker,
-            "side": side,
-            "tp": tp_price,
-            "sl": sl,
             "tp_side": tp_side,
+            "tp_price": tp_price,
             "qty": str(quantity),
         }
-        logger.info(f"Entry {entry_order_id} added to pending monitor for {ticker}")
+        logger.info(f"Pending TP for {ticker} after entry {entry_order_id} fills")
 
-        trade_record = {
-            "id": order["result"].get("orderId", "unknown"),
+        trades.append({
+            "id": entry_order_id,
             "ticker": ticker, "side": side, "entry": limit_price,
             "tp": tp, "sl": sl, "quantity": quantity,
             "leverage": leverage, "status": "Open", "pnl": 0.0,
             "entryType": "limit",
             "timestamp": int(time.time() * 1000)
-        }
-        trades.append(trade_record)
+        })
         return jsonify({"status": "success", "order": order, "entryType": "limit"}), 200
 
     except Exception as e:
@@ -477,8 +428,6 @@ def update_trade_tp(trade_id):
 def sync_trades():
     try:
         session = get_session()
-
-        # Fetch all positions with pagination support
         all_positions = []
         cursor = ""
         while True:
@@ -489,12 +438,10 @@ def sync_trades():
 
             if positions.get("retCode", -1) != 0:
                 error_msg = positions.get("retMsg", "Bybit API error")
-                logger.error(f"sync_trades Bybit error: {error_msg}")
+                logger.error(f"sync error: {error_msg}")
                 return jsonify({"error": error_msg}), 502
 
-            position_list = positions.get("result", {}).get("list", [])
-            all_positions.extend(position_list)
-
+            all_positions.extend(positions.get("result", {}).get("list", []))
             cursor = positions.get("result", {}).get("nextPageCursor", "")
             if not cursor:
                 break
@@ -503,7 +450,6 @@ def sync_trades():
             size = float(pos.get("size", 0))
             if size == 0:
                 continue
-
             symbol = pos.get("symbol", "")
             unrealised_pnl = float(pos.get("unrealisedPnl", 0))
 
@@ -519,7 +465,6 @@ def sync_trades():
                     ts = int(float(created)) if created else int(time.time() * 1000)
                 except (ValueError, TypeError):
                     ts = int(time.time() * 1000)
-
                 trades.append({
                     "id": f"synced-{symbol}-{int(time.time())}",
                     "ticker": symbol,
@@ -534,19 +479,19 @@ def sync_trades():
                     "timestamp": ts
                 })
 
-        open_symbols = {pos.get("symbol") for pos in all_positions if float(pos.get("size", 0)) > 0}
+        open_symbols = {p.get("symbol") for p in all_positions if float(p.get("size", 0)) > 0}
         for t in trades:
             if t["status"] == "Open" and t["ticker"] not in open_symbols:
                 t["status"] = "Closed"
 
-        logger.info(f"Synced {len(all_positions)} positions from Bybit")
+        logger.info(f"Synced {len(all_positions)} positions")
         return jsonify({"status": "synced", "positions": len(all_positions)}), 200
     except Exception as e:
-        logger.exception(f"sync_trades error: {e}")
+        logger.exception(f"sync error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-# ── Serve React frontend ─────────────────────────────────────────────────────
+# ── Serve React frontend ──
 DIST_DIR = os.path.join(os.path.dirname(__file__), "dist")
 
 @app.route("/", defaults={"path": ""})
