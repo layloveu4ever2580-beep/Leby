@@ -300,12 +300,12 @@ def webhook():
         except Exception:
             limit_price = round(limit_price, 4)
 
-        # 1) LIMIT order to ENTER position with SL attached
+        # 1) LIMIT order to ENTER position
         logger.info(f"Placing LIMIT {side} entry: {ticker} qty={quantity} price={limit_price} sl={sl}")
         order = bybit_call(get_session().place_order,
                            category="linear", symbol=ticker, side=side,
                            orderType="Limit", qty=str(quantity),
-                           price=str(limit_price), stopLoss=str(sl),
+                           price=str(limit_price),
                            timeInForce="GTC")
         logger.info(f"Limit entry response: {order}")
 
@@ -321,13 +321,13 @@ def webhook():
             })
             return jsonify({"error": error_msg}), 400
 
-        # 2) Monitor entry fill in background, then place TP limit order
-        #    Can't place reduce-only TP until position exists (entry limit filled).
+        # 2) Monitor entry fill in background, then place SL + TP
+        #    Can't place reduce-only TP or set trading stop until position exists.
         entry_order_id = order["result"].get("orderId", "")
         tp_side = "Sell" if side == "Buy" else "Buy"
 
-        def _place_tp_after_fill(order_id, sym, tp_s, qty, take_profit):
-            """Poll entry order until filled, then place reduce-only TP limit."""
+        def _place_tp_sl_after_fill(order_id, sym, tp_s, qty, take_profit, stop_loss):
+            """Poll entry order until filled, then place reduce-only TP limit + SL."""
             session = get_session()
             poll_interval = 3  # seconds
 
@@ -341,14 +341,23 @@ def webhook():
 
                     if not order_list:
                         # Order no longer open — filled or cancelled
-                        # Check if position actually exists
                         pos = bybit_call(session.get_positions,
                                          category="linear", symbol=sym)
                         pos_list = pos.get("result", {}).get("list", [])
                         has_position = any(float(p.get("size", 0)) > 0 for p in pos_list)
 
                         if has_position:
-                            logger.info(f"Entry filled for {sym}, placing TP limit {tp_s} @ {take_profit}")
+                            # Set SL via trading stop
+                            logger.info(f"Entry filled for {sym}, setting SL @ {stop_loss}")
+                            try:
+                                bybit_call(session.set_trading_stop,
+                                           category="linear", symbol=sym,
+                                           stopLoss=str(stop_loss), positionIdx=0)
+                            except Exception as e:
+                                logger.warning(f"Failed to set SL for {sym}: {e}")
+
+                            # Place TP as reduce-only limit
+                            logger.info(f"Placing TP limit {tp_s} @ {take_profit}")
                             tp_ord = bybit_call(session.place_order,
                                                 category="linear", symbol=sym, side=tp_s,
                                                 orderType="Limit", qty=str(qty),
@@ -361,13 +370,15 @@ def webhook():
                                     "side": tp_s, "qty": str(qty)
                                 }
                             else:
-                                # Fallback to trading stop if limit fails
                                 logger.warning(f"TP limit failed: {tp_ord.get('retMsg')}, using trading stop")
-                                bybit_call(session.set_trading_stop,
-                                           category="linear", symbol=sym,
-                                           takeProfit=str(take_profit), positionIdx=0)
+                                try:
+                                    bybit_call(session.set_trading_stop,
+                                               category="linear", symbol=sym,
+                                               takeProfit=str(take_profit), positionIdx=0)
+                                except Exception as e2:
+                                    logger.error(f"TP trading stop also failed: {e2}")
                         else:
-                            logger.info(f"Entry order {order_id} for {sym} was cancelled/rejected, no TP needed")
+                            logger.info(f"Entry order {order_id} for {sym} was cancelled/rejected, no TP/SL needed")
                             for t in trades:
                                 if t["id"] == order_id and t["status"] == "Open":
                                     t["status"] = "Cancelled"
@@ -375,7 +386,7 @@ def webhook():
 
                     status = order_list[0].get("orderStatus", "")
                     if status in ("Cancelled", "Rejected", "Deactivated"):
-                        logger.info(f"Entry {order_id} for {sym} status={status}, no TP needed")
+                        logger.info(f"Entry {order_id} for {sym} status={status}, no TP/SL needed")
                         for t in trades:
                             if t["id"] == order_id and t["status"] == "Open":
                                 t["status"] = "Cancelled"
@@ -385,8 +396,8 @@ def webhook():
                     logger.warning(f"Error polling entry order {order_id}: {e}")
 
         threading.Thread(
-            target=_place_tp_after_fill,
-            args=(entry_order_id, ticker, tp_side, quantity, tp),
+            target=_place_tp_sl_after_fill,
+            args=(entry_order_id, ticker, tp_side, quantity, tp, sl),
             daemon=True
         ).start()
 
