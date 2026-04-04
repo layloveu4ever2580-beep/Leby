@@ -423,7 +423,7 @@ def webhook():
         last_price = float(ticker_info["result"]["list"][0]["lastPrice"])
         logger.info(f"{ticker} last_price={last_price}, entry={entry}, tp={tp}, sl={sl}, side={side}")
 
-        price_for_calc = last_price if last_price > 0 else entry
+        price_for_calc = entry
         tp_distance = abs(price_for_calc - tp)
         if tp_distance == 0:
             return jsonify({"error": "TP distance is zero"}), 400
