@@ -262,7 +262,7 @@ if buy_confirmed
 
     // Build JSON for webhook
     string cleanTicker = str.replace(syminfo.ticker, ".P", "")
-    string webhook_json = '{"ticker":"' + cleanTicker + '","action":"buy","entry":' + str.tostring(entry_price) + ',"tp":' + str.tostring(take_profit) + ',"sl":' + str.tostring(stop_loss) + '}'
+    string webhook_json = '{"ticker":"' + cleanTicker + '","action":"buy","limit":' + str.tostring(entry_price) + ',"entry":' + str.tostring(entry_price) + ',"tp":' + str.tostring(take_profit) + ',"sl":' + str.tostring(stop_loss) + '}'
 
     // Send webhook alert immediately on confirmation candle close (limit entry signal)
     if enable_webhooks
@@ -293,7 +293,7 @@ if sell_confirmed
 
     // Build JSON for webhook
     string cleanTicker = str.replace(syminfo.ticker, ".P", "")
-    string webhook_json = '{"ticker":"' + cleanTicker + '","action":"sell","entry":' + str.tostring(entry_price) + ',"tp":' + str.tostring(take_profit) + ',"sl":' + str.tostring(stop_loss) + '}'
+    string webhook_json = '{"ticker":"' + cleanTicker + '","action":"sell","limit":' + str.tostring(entry_price) + ',"entry":' + str.tostring(entry_price) + ',"tp":' + str.tostring(take_profit) + ',"sl":' + str.tostring(stop_loss) + '}'
 
     // Send webhook alert immediately on confirmation candle close (limit entry signal)
     if enable_webhooks
