@@ -15,5 +15,7 @@ LEVERAGE_CONFIG = {
     "ILVUSDT": 20,
     "MAGICUSDT": 25,
     "DOGEUSDT": 75,
+    "DEEPUSDT": 25,
+    "ICXUSDT": 25,
     # Add more as needed
 }
