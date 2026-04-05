@@ -17,5 +17,7 @@ LEVERAGE_CONFIG = {
     "DOGEUSDT": 75,
     "DEEPUSDT": 25,
     "ICXUSDT": 25,
+    "COMPUSDT": 25,
+    "VIRTUALUSDT": 50,
     # Add more as needed
 }
