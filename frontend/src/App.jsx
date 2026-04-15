@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Settings, RefreshCw, DollarSign, TrendingUp, Activity, Waves, Loader2 } from 'lucide-react';
+import { Settings, RefreshCw, DollarSign, TrendingUp, Activity, Waves, Loader2, Plus, Trash2, Coins } from 'lucide-react';
 import './App.css';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -13,6 +13,11 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState(null);
+  const [leverageConfig, setLeverageConfig] = useState({});
+  const [showLeverage, setShowLeverage] = useState(false);
+  const [newSymbol, setNewSymbol] = useState('');
+  const [newLeverage, setNewLeverage] = useState(10);
+  const [leverageLoading, setLeverageLoading] = useState(false);
 
   const fetchTrades = useCallback(async () => {
     setLoading(true);
@@ -44,7 +49,60 @@ function App() {
   useEffect(() => {
     fetchTrades();
     fetchSettings();
+    fetchLeverage();
   }, [fetchTrades, fetchSettings]);
+
+  const fetchLeverage = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/leverage`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setLeverageConfig(data);
+    } catch (err) {
+      console.error('Failed to fetch leverage config', err);
+    }
+  };
+
+  const addLeverage = async (e) => {
+    e.preventDefault();
+    if (!newSymbol.trim()) return;
+    setLeverageLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/leverage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: newSymbol.trim(), leverage: newLeverage }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || 'Failed to add symbol');
+      }
+      const data = await res.json();
+      setLeverageConfig(data);
+      setNewSymbol('');
+      setNewLeverage(10);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLeverageLoading(false);
+    }
+  };
+
+  const deleteLeverage = async (symbol) => {
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/leverage/${symbol}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || 'Failed to delete symbol');
+      }
+      const data = await res.json();
+      setLeverageConfig(data);
+    } catch (err) {
+      setError(err.message);
+    }
+  };
 
   const syncTrades = async () => {
     setSyncing(true);
@@ -130,6 +188,9 @@ function App() {
           <button className="theme-toggle" onClick={toggleTheme} aria-label="Toggle theme">
             {settings.theme === 'dark' ? '🌙' : '☀️'}
           </button>
+          <button className="btn-leverage" onClick={() => setShowLeverage(!showLeverage)}>
+            <Coins size={18} /> Leverage
+          </button>
           <button className="btn-settings" onClick={() => setShowSettings(!showSettings)}>
             <Settings size={18} /> Settings
           </button>
@@ -158,6 +219,63 @@ function App() {
             </div>
             <button type="submit" className="btn-save">Save Settings</button>
           </form>
+        </section>
+      )}
+
+      {showLeverage && (
+        <section className="leverage-panel card">
+          <h2>Leverage Config</h2>
+          <p className="leverage-subtitle">Manage trading pairs and their leverage multipliers</p>
+
+          <form onSubmit={addLeverage} className="leverage-form">
+            <div className="leverage-form-row">
+              <input
+                type="text"
+                placeholder="Symbol (e.g. BTCUSDT)"
+                value={newSymbol}
+                onChange={(e) => setNewSymbol(e.target.value.toUpperCase())}
+                className="leverage-input symbol-input"
+                required
+              />
+              <input
+                type="number"
+                placeholder="Leverage"
+                min="1"
+                max="100"
+                value={newLeverage}
+                onChange={(e) => setNewLeverage(parseInt(e.target.value) || 1)}
+                className="leverage-input leverage-num-input"
+                required
+              />
+              <button type="submit" className="btn-add-leverage" disabled={leverageLoading}>
+                {leverageLoading ? <Loader2 size={14} className="spin" /> : <Plus size={14} />}
+                Add
+              </button>
+            </div>
+          </form>
+
+          <div className="leverage-grid">
+            {Object.entries(leverageConfig)
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([symbol, leverage]) => (
+                <div key={symbol} className="leverage-item">
+                  <div className="leverage-item-info">
+                    <span className="leverage-symbol">{symbol}</span>
+                    <span className="leverage-value">{leverage}x</span>
+                  </div>
+                  <button
+                    className="btn-delete-leverage"
+                    onClick={() => deleteLeverage(symbol)}
+                    aria-label={`Remove ${symbol}`}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ))}
+            {Object.keys(leverageConfig).length === 0 && (
+              <p className="leverage-empty">No symbols configured yet. Add one above.</p>
+            )}
+          </div>
         </section>
       )}
 

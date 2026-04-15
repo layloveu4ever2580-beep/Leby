@@ -5,6 +5,8 @@ services:
       dockerfile: Dockerfile
     ports:
       - "5001:10000"
+    volumes:
+      - leverage-data:/app/data
     environment:
       - BYBIT_API_KEY=${BYBIT_API_KEY}
       - BYBIT_API_SECRET=${BYBIT_API_SECRET}
@@ -17,3 +19,6 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+volumes:
+  leverage-data:

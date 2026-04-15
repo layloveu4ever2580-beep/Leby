@@ -25,6 +25,9 @@ COPY backend/ .
 # Copy built React app into backend/dist so Flask can serve it
 COPY --from=frontend-build /app/frontend/dist ./dist
 
+# Persistent data directory for leverage config
+RUN mkdir -p /app/data
+
 EXPOSE 10000
 
 CMD gunicorn main:app -b 0.0.0.0:${PORT:-10000} --workers 2

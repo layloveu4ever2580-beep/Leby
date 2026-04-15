@@ -6,7 +6,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from pybit.unified_trading import HTTP
 from dotenv import load_dotenv
 from flask_cors import CORS
-from leverage_config import LEVERAGE_CONFIG
+from leverage_config import LEVERAGE_CONFIG, save_leverage_config
 
 load_dotenv()
 
@@ -375,6 +375,40 @@ def update_settings():
     if "timezone" in data:
         settings["timezone"] = data["timezone"]
     return jsonify(settings), 200
+
+
+@app.route("/api/leverage", methods=["GET"])
+def get_leverage():
+    return jsonify(LEVERAGE_CONFIG), 200
+
+
+@app.route("/api/leverage", methods=["POST"])
+def add_leverage():
+    """Add or update a symbol's leverage. Body: { "symbol": "BTCUSDT", "leverage": 50 }"""
+    data = request.json
+    symbol = (data.get("symbol") or "").strip().upper()
+    leverage = data.get("leverage")
+    if not symbol or leverage is None:
+        return jsonify({"error": "symbol and leverage are required"}), 400
+    try:
+        leverage = int(leverage)
+    except (ValueError, TypeError):
+        return jsonify({"error": "leverage must be an integer"}), 400
+    if leverage < 1 or leverage > 100:
+        return jsonify({"error": "leverage must be between 1 and 100"}), 400
+    LEVERAGE_CONFIG[symbol] = leverage
+    save_leverage_config(LEVERAGE_CONFIG)
+    return jsonify(LEVERAGE_CONFIG), 200
+
+
+@app.route("/api/leverage/<symbol>", methods=["DELETE"])
+def delete_leverage(symbol):
+    symbol = symbol.strip().upper()
+    if symbol not in LEVERAGE_CONFIG:
+        return jsonify({"error": f"{symbol} not found"}), 404
+    del LEVERAGE_CONFIG[symbol]
+    save_leverage_config(LEVERAGE_CONFIG)
+    return jsonify(LEVERAGE_CONFIG), 200
 
 
 @app.route("/webhook", methods=["POST"])

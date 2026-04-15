@@ -441,3 +441,177 @@ body {
     flex-wrap: wrap;
   }
 }
+
+/* Leverage button */
+.btn-leverage {
+  background: #8b5cf6;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  padding: 10px 20px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: background 0.2s;
+}
+.btn-leverage:hover { background: #7c3aed; }
+
+/* Leverage panel */
+.leverage-panel h2 {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.leverage-subtitle {
+  font-size: 14px;
+  color: #64748b;
+  margin-bottom: 20px;
+}
+.app-container.dark .leverage-subtitle { color: #94a3b8; }
+
+.leverage-form {
+  margin-bottom: 20px;
+}
+
+.leverage-form-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.leverage-input {
+  padding: 10px 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+.leverage-input:focus {
+  border-color: #8b5cf6;
+  box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.1);
+}
+.app-container.dark .leverage-input {
+  background: #0f172a;
+  border-color: #334155;
+  color: #f8fafc;
+}
+
+.symbol-input {
+  flex: 1;
+  min-width: 160px;
+  text-transform: uppercase;
+}
+
+.leverage-num-input {
+  width: 100px;
+}
+
+.btn-add-leverage {
+  background: #8b5cf6;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  padding: 10px 20px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 0.2s;
+  white-space: nowrap;
+}
+.btn-add-leverage:hover { background: #7c3aed; }
+.btn-add-leverage:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.leverage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.leverage-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  transition: background 0.15s;
+}
+.leverage-item:hover {
+  background: #f1f5f9;
+}
+.app-container.dark .leverage-item {
+  background: #0f172a;
+  border-color: #334155;
+}
+.app-container.dark .leverage-item:hover {
+  background: #1a2744;
+}
+
+.leverage-item-info {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.leverage-symbol {
+  font-weight: 600;
+  font-size: 14px;
+  color: #0f172a;
+}
+.app-container.dark .leverage-symbol { color: #f8fafc; }
+
+.leverage-value {
+  font-size: 13px;
+  font-weight: 500;
+  color: #8b5cf6;
+  background: rgba(139, 92, 246, 0.1);
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+.btn-delete-leverage {
+  background: none;
+  border: none;
+  color: #94a3b8;
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  transition: color 0.15s, background 0.15s;
+}
+.btn-delete-leverage:hover {
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.leverage-empty {
+  grid-column: 1 / -1;
+  text-align: center;
+  color: #94a3b8;
+  padding: 24px;
+  font-size: 14px;
+}
+
+@media (max-width: 640px) {
+  .leverage-form-row {
+    flex-direction: column;
+  }
+  .symbol-input,
+  .leverage-num-input {
+    width: 100%;
+    min-width: unset;
+  }
+  .leverage-grid {
+    grid-template-columns: 1fr;
+  }
+}
